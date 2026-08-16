@@ -44,7 +44,7 @@ local CFG = {
     M1HoldTime    = 0.05,   -- Thời gian giữ chuột cho mỗi đòn Melee
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     RemoteAttackDelay = 0.12,
-    MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
+    MoveSpeed         = 270,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     CoreSnapDistance  = 150,  -- toTarget(cf): snap khi đã gần
     FruitSnapDistance = 8,    -- toTarget(cf, true): ngưỡng gốc
 
