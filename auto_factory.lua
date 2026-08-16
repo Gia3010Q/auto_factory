@@ -44,7 +44,7 @@ local CFG = {
     M1HoldTime    = 0.05,   -- Thời gian giữ chuột cho mỗi đòn Melee
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     RemoteAttackDelay = 0.12,
-    MoveSpeed         = 270,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
+    MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     CoreSnapDistance  = 150,  -- toTarget(cf): snap khi đã gần
     FruitSnapDistance = 8,    -- toTarget(cf, true): ngưỡng gốc
 
@@ -303,18 +303,17 @@ local moveState = {
     speed = 0,
     collisionState = {},
     floatForce = nil,
+    previousPlatformStand = nil,
+    platformHumanoid = nil,
+    addedTeleportTag = false,
 }
 
 local function MarkTeleporting()
     pcall(function()
         if not CollectionService:HasTag(lp, "Teleporting") then
             CollectionService:AddTag(lp, "Teleporting")
+            moveState.addedTeleportTag = true
         end
-    end)
-    task.delay(1.5, function()
-        pcall(function()
-            CollectionService:RemoveTag(lp, "Teleporting")
-        end)
     end)
 end
 
@@ -347,11 +346,21 @@ local function RestoreMoveCharacter()
     if force then pcall(function() force:Destroy() end) end
 
     local hrp = GetHRP()
-    local humanoid = GetHumanoid()
     if hrp then
         StopRootVelocity(hrp)
     end
-    if humanoid then humanoid.PlatformStand = false end
+    local platformHumanoid = moveState.platformHumanoid
+    if platformHumanoid and platformHumanoid.Parent
+        and moveState.previousPlatformStand ~= nil then
+        platformHumanoid.PlatformStand = moveState.previousPlatformStand
+    end
+    moveState.previousPlatformStand = nil
+    moveState.platformHumanoid = nil
+
+    if moveState.addedTeleportTag then
+        pcall(function() CollectionService:RemoveTag(lp, "Teleporting") end)
+        moveState.addedTeleportTag = false
+    end
 
     for part, oldCanCollide in pairs(moveState.collisionState) do
         if part and part.Parent then
@@ -439,6 +448,10 @@ local function ToTarget(cf, shortSnap, purpose)
     CancelMove(false)
     globalEnv.noclip = true
     EnsureMoveFloat(hrp)
+    if moveState.previousPlatformStand == nil then
+        moveState.previousPlatformStand = humanoid.PlatformStand
+        moveState.platformHumanoid = humanoid
+    end
     humanoid.PlatformStand = true
     MarkTeleporting()
     StopRootVelocity(hrp)
@@ -711,7 +724,6 @@ end
 -- Đếm số fruit đang trong Backpack + Character
 -- ─────────────────────────────────────────────
 local ignoredStoreItems = setmetatable({}, { __mode = "k" })
-local fullFruitStorage = {}
 
 local function IsStoreIgnored(item)
     return ignoredStoreItems[item] == true
@@ -766,9 +778,8 @@ local function GetFruitStorageName(item)
     return baseName .. "-" .. baseName
 end
 
-local function MarkFruitStoreIgnored(item, storageName)
+local function MarkFruitStoreIgnored(item)
     ignoredStoreItems[item] = true
-    fullFruitStorage[storageName] = true
 
     -- Source gốc cũng gắn "Ignored" sau khi đã thử lưu để Tool đó
     -- không bị gửi StoreFruit lặp lại ở các vòng sau.
@@ -815,12 +826,11 @@ local function StoreFruitInBackpack()
                     continue
                 end
 
-                -- Khi server đã từ chối một loại Fruit vì kho loại đó đầy,
-                -- bỏ qua toàn bộ Tool cùng loại cho tới khi chạy lại script.
-                if fullFruitStorage[storageName] or IsStoreIgnored(item) then
-                    MarkFruitStoreIgnored(item, storageName)
+                -- Source gốc chỉ đánh dấu đúng Tool đã thử, không được suy ra cả
+                -- loại Fruit đã đầy vì server cũng có thể từ chối tạm thời.
+                if IsStoreIgnored(item) then
                     skipped = skipped + 1
-                    Log("Skip StoreFruit (storage full): " .. itemName)
+                    Log("Skip StoreFruit (đã thử): " .. itemName)
                     continue
                 end
 
@@ -841,9 +851,9 @@ local function StoreFruitInBackpack()
                 elseif ok then
                     -- InvokeServer chạy thành công nhưng Tool vẫn còn: server đã
                     -- từ chối lưu (trường hợp thường gặp là đủ số lượng loại Fruit).
-                    MarkFruitStoreIgnored(item, storageName)
+                    MarkFruitStoreIgnored(item)
                     skipped = skipped + 1
-                    Log("Storage full/rejected, skip from now: "
+                    Log("StoreFruit rejected, skip this Tool: "
                         .. itemName .. " | " .. tostring(result))
                 else
                     -- Lỗi gọi Remote có thể chỉ là tạm thời nên chưa đánh dấu full.
@@ -887,24 +897,54 @@ local function LoadBannerClient()
     return bannerClient
 end
 
-local function GetRandomFruitBoxName()
+local function GetRandomFruitBoxCandidates()
+    local candidates = {}
     local controller, loadError = LoadBannerClient()
-    if not controller then return nil, loadError end
-    if type(controller.TryGetBannerItemIfActiveAsync) ~= "function" then
-        return nil, "BannerClient thiếu TryGetBannerItemIfActiveAsync"
+    local bannerError = loadError
+
+    if controller and type(controller.TryGetBannerItemIfActiveAsync) == "function" then
+        local ok, item = pcall(function()
+            -- Source gốc gọi bằng dấu chấm, không truyền self.
+            return controller.TryGetBannerItemIfActiveAsync()
+        end)
+        if ok and item then
+            -- Source gốc chỉ dùng DLCBoxData khi có banner item nhưng item thiếu BoxName.
+            local boxName = type(item.BoxName) == "string" and item.BoxName or ""
+            if boxName == "" then boxName = "DLCBoxData" end
+            table.insert(candidates, {
+                hasBox = true,
+                name = boxName,
+                label = boxName,
+            })
+        elseif not ok then
+            bannerError = "Đọc banner lỗi: " .. tostring(item)
+        end
+    elseif controller then
+        bannerError = "BannerClient thiếu TryGetBannerItemIfActiveAsync"
     end
 
-    local ok, item = pcall(function()
-        -- Source gốc gọi bằng dấu chấm, không truyền self.
-        return controller.TryGetBannerItemIfActiveAsync()
-    end)
-    if not ok then return nil, "Đọc banner lỗi: " .. tostring(item) end
+    -- Một số phiên bản game dùng chữ ký Cousin cũ, không có tham số BoxName.
+    -- Đặt nó sau banner candidate và chỉ dùng khi Check trả về đủ 3 số hợp lệ.
+    table.insert(candidates, {
+        hasBox = false,
+        name = nil,
+        label = "Legacy",
+    })
+    return candidates, bannerError
+end
 
-    -- Source gốc dùng DLCBoxData khi banner hiện tại không có BoxName.
-    if item and type(item.BoxName) == "string" and item.BoxName ~= "" then
-        return item.BoxName, item
+local function InvokeCousin(commF, action, candidate)
+    if action == "Buy" then
+        if candidate.hasBox then
+            return commF:InvokeServer("Cousin", candidate.name)
+        end
+        return commF:InvokeServer("Cousin")
     end
-    return "DLCBoxData", item
+
+    if candidate.hasBox then
+        return commF:InvokeServer("Cousin", action, candidate.name)
+    end
+    return commF:InvokeServer("Cousin", action)
 end
 
 local function LoadSpinnerController()
@@ -925,8 +965,13 @@ end
 local function CloseRandomFruitSpinner(spinnerWindow)
     if not spinnerWindow or not spinnerWindow.Enabled then return true end
 
-    local closeButton = spinnerWindow:FindFirstChild("CloseButton", true)
-    if closeButton and closeButton:IsA("GuiObject") and not closeButton.Visible then
+    local aboveSpinner = spinnerWindow:FindFirstChild("AboveSpinner")
+    local navigation = aboveSpinner and aboveSpinner:FindFirstChild("Navigation")
+    local closeButton = navigation and navigation:FindFirstChild("CloseButton")
+    if not closeButton or not closeButton:IsA("GuiObject") then
+        return false, "Spinner đang khởi tạo"
+    end
+    if not closeButton.Visible then
         return false, "Spinner đang quay"
     end
 
@@ -945,9 +990,9 @@ local function RandomFruit()
     local playerGui = lp:FindFirstChild("PlayerGui")
     local spinnerWindow = playerGui and playerGui:FindFirstChild("SpinnerWindow")
 
-    -- Source gốc đợi SpinnerWindow tồn tại; khi vòng quay mở thì đóng nó trước.
-    if not spinnerWindow then return false, "SpinnerNotReady" end
-    if spinnerWindow.Enabled then
+    -- SpinnerWindow có thể chưa được game tạo trước lần mua đầu tiên. Chỉ chờ/đóng
+    -- khi cửa sổ thực sự đang mở; không chặn Cousin remote vì thiếu GUI này.
+    if spinnerWindow and spinnerWindow.Enabled then
         local closed, closeStatus = CloseRandomFruitSpinner(spinnerWindow)
         return false, closed and "SpinnerClosed" or closeStatus
     end
@@ -955,35 +1000,55 @@ local function RandomFruit()
     local commF = GetCommF()
     if not commF then return false, "Không tìm thấy CommF_" end
 
-    local boxName, boxError = GetRandomFruitBoxName()
-    if not boxName then return false, boxError end
+    local candidates, bannerError = GetRandomFruitBoxCandidates()
+    local lastCheckError = bannerError
 
-    local checkOk, money, level, price = pcall(function()
-        return commF:InvokeServer("Cousin", "Check", boxName)
-    end)
-    if not checkOk then return false, "Cousin Check lỗi: " .. tostring(money) end
+    for _, candidate in ipairs(candidates) do
+        local checkOk, money, level, price = pcall(function()
+            return InvokeCousin(commF, "Check", candidate)
+        end)
+        local numericMoney = checkOk and tonumber(money) or nil
+        local numericLevel = checkOk and tonumber(level) or nil
+        local numericPrice = checkOk and tonumber(price) or nil
 
-    level = tonumber(level) or 0
-    if level < 50 then return false, "Level" end
+        -- Chỉ chọn chữ ký remote khi Check trả đúng cấu trúc. Nhờ vậy fallback
+        -- legacy không bao giờ gửi lệnh Buy nếu game không hỗ trợ nó.
+        if numericMoney and numericLevel and numericPrice then
+            if numericLevel < 50 then return false, "Level" end
+            if numericMoney < numericPrice then
+                return false, "Money", numericPrice - numericMoney
+            end
 
-    money = tonumber(money) or 0
-    price = tonumber(price) or math.huge
-    if money < price then return false, "Money", price - money end
+            local timeOk, canBuy = pcall(function()
+                return InvokeCousin(commF, "CheckTime", candidate)
+            end)
+            if not timeOk then
+                return false, "Cousin CheckTime lỗi (" .. candidate.label .. "): "
+                    .. tostring(canBuy)
+            end
+            if canBuy ~= true then return false, "Cooldown" end
 
-    local timeOk, canBuy = pcall(function()
-        return commF:InvokeServer("Cousin", "CheckTime", boxName)
-    end)
-    if not timeOk then return false, "Cousin CheckTime lỗi: " .. tostring(canBuy) end
-    if canBuy ~= true then return false, "Cooldown" end
+            local buyOk, resultCode, reward = pcall(function()
+                return InvokeCousin(commF, "Buy", candidate)
+            end)
+            if not buyOk then
+                return false, "Cousin Buy lỗi (" .. candidate.label .. "): "
+                    .. tostring(resultCode)
+            end
+            if resultCode ~= 1 then return false, "BuyRejected", resultCode end
 
-    local buyOk, resultCode, reward = pcall(function()
-        return commF:InvokeServer("Cousin", boxName)
-    end)
-    if not buyOk then return false, "Cousin Buy lỗi: " .. tostring(resultCode) end
-    if resultCode ~= 1 then return false, "BuyRejected", resultCode end
+            Log("Random Fruit thành công: " .. tostring(reward or candidate.label))
+            return true, "Bought", reward or candidate.label
+        end
 
-    Log("Random Fruit thành công: " .. tostring(reward or boxName))
-    return true, "Bought", reward or boxName
+        if checkOk then
+            lastCheckError = "Cousin Check trả dữ liệu không hợp lệ (" .. candidate.label .. ")"
+        else
+            lastCheckError = "Cousin Check lỗi (" .. candidate.label .. "): " .. tostring(money)
+        end
+    end
+
+    return false, lastCheckError or "Không tìm được chữ ký Cousin phù hợp"
 end
 
 -- ─────────────────────────────────────────────
@@ -1138,8 +1203,6 @@ task.spawn(function()
                 lblRandom.Text = "🎲 Random: Đang chờ cooldown"
             elseif status == "SpinnerClosed" then
                 lblRandom.Text = "🎲 Random: Đã đóng vòng quay"
-            elseif status == "SpinnerNotReady" then
-                lblRandom.Text = "🎲 Random: Chờ SpinnerWindow"
             elseif status == "BuyRejected" then
                 lblRandom.Text = "⚠️ Random bị từ chối: " .. tostring(detail)
             else
@@ -1253,9 +1316,9 @@ task.spawn(function()
                 if storeError == "cooldown" then
                     lblStore.Text = string.format("📦 Chờ lưu: %d fruit(s)", count)
                 elseif skipped > 0 and stored > 0 then
-                    lblStore.Text = string.format("✅ Lưu %d | ⏭️ Bỏ qua %d (đầy)", stored, skipped)
+                    lblStore.Text = string.format("✅ Lưu %d | ⏭️ Bỏ qua %d", stored, skipped)
                 elseif skipped > 0 then
-                    lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit (kho đầy)", skipped)
+                    lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit đã bị từ chối", skipped)
                 elseif attempted > 0 and stored == attempted then
                     lblStore.Text = string.format("✅ Đã lưu %d fruit(s)", stored)
                 elseif attempted > 0 then
@@ -1264,7 +1327,7 @@ task.spawn(function()
                     lblStore.Text = "⚠️ " .. tostring(storeError or "Không lưu được Fruit")
                 end
             elseif ignored > 0 then
-                lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit (kho đầy)", ignored)
+                lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit đã bị từ chối", ignored)
             else
                 lblStore.Text = "📦 Storage: Sẵn sàng"
             end
@@ -1294,6 +1357,9 @@ task.spawn(function()
                 continue
             end
 
+            -- Fruit có thể despawn trong lúc đang bay. Nếu không hủy, Heartbeat
+            -- vẫn kéo nhân vật tới CFrame cũ dù FindFruitInWorld đã trả nil.
+            if moveState.purpose == "Fruit" then CancelMove(true) end
             if fruitMode then
                 fruitMode = false
                 lblFruit.Text = "🍎 Fruit: Không thấy"
@@ -1301,6 +1367,7 @@ task.spawn(function()
                 lblFruit.Text = "🍎 Fruit: Chờ spawn..."
             end
         else
+            if moveState.purpose == "Fruit" then CancelMove(true) end
             fruitMode = false
             lblFruit.Text = "🍎 Auto Fruit: Đã tắt"
         end
