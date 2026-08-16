@@ -9,6 +9,7 @@
     ✅ Auto tìm & đánh boss Core (Factory Sea 2)
     ✅ Auto tìm Fruit rơi trong map
     ✅ Auto tele đến Fruit và nhặt
+    ✅ Auto Random Devil Fruit theo logic Cousin/Banner gốc
     ✅ Auto lưu Fruit vừa nhặt vào Storage
     ✅ Anti-AFK, tránh bị kick khi treo máy
     ✅ GUI đẹp có thể kéo, nút STOP, hiện trạng thái
@@ -24,10 +25,11 @@
 -- ─────────────────────────────────────────────
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
 local UserInputService  = game:GetService("UserInputService")
 local VIM               = game:GetService("VirtualInputManager")
 local VirtualUser       = game:GetService("VirtualUser")
+local CollectionService = game:GetService("CollectionService")
 
 local lp = Players.LocalPlayer
 
@@ -42,19 +44,19 @@ local CFG = {
     M1HoldTime    = 0.05,   -- Thời gian giữ chuột cho mỗi đòn Melee
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     RemoteAttackDelay = 0.12,
-    TweenSpeed        = 300,  -- Speed Tween gốc mặc định 300 studs/s
+    MoveSpeed         = 300,  -- Tốc độ di chuyển tới Core (studs/s)
     CoreSnapDistance  = 150,  -- toTarget(cf): snap khi đã gần
     FruitSnapDistance = 8,    -- toTarget(cf, true): ngưỡng gốc
-    MoveStallTimeout  = 1.5,  -- Tạo lại tween nếu không tiến thêm trong thời gian này
-    MoveProgressEpsilon = 2,  -- Số studs tối thiểu được tính là đang di chuyển
 
     -- Fruit
     FruitEnabled  = true,   -- Bật/tắt tính năng tìm fruit
     FruitRange    = 0,      -- <= 0: không giới hạn, quét mọi Fruit trong cùng Sea
-    FruitTweenSpeed = 450,  -- Fruit xa: tween nhanh, tránh CFrame jump bị server kéo lùi
+    FruitMoveSpeed = 150,  -- Tốc độ di chuyển tới Fruit (studs/s)
     PickupDist    = 5,       -- Khoảng cách nhặt (phải đứng gần bao nhiêu)
     AutoStore     = true,   -- Tự lưu Fruit vật phẩm đang giữ
     StoreCooldown = 3,      -- Khoảng nghỉ giữa các lần thử lưu (giây)
+    AutoRandomFruit = true, -- Random Fruit từ NPC Cousin khi đủ điều kiện
+    RandomFruitInterval = 0.5, -- Chu kỳ gốc của Banana Cat Hub
 
     -- Combat: chỉ dùng Fighting Style, không fallback vũ khí khác
     AutoEquipMelee = true,
@@ -66,9 +68,9 @@ local CFG = {
 -- GLOBAL SWITCH
 -- ─────────────────────────────────────────────
 local globalEnv = getgenv()
-if globalEnv.AutoFactoryTween then
-    pcall(function() globalEnv.AutoFactoryTween:Cancel() end)
-    globalEnv.AutoFactoryTween = nil
+if type(globalEnv.AutoFactoryMoveCleanup) == "function" then
+    pcall(globalEnv.AutoFactoryMoveCleanup)
+    globalEnv.AutoFactoryMoveCleanup = nil
 end
 if type(globalEnv.AutoFactoryConnections) == "table" then
     for _, connection in ipairs(globalEnv.AutoFactoryConnections) do
@@ -284,31 +286,102 @@ local function IsMobAlive(mob)
     return root ~= nil and humanoid ~= nil and humanoid.Health > 0
 end
 
--- Bản toTarget thu gọn cho Factory/Fruit trong cùng Sea.
--- Tham số shortSnap khớp cách source gọi toTarget(fruit.Handle.CFrame, true).
-local activeTweenTarget = nil
-local activeTweenPurpose = nil
-local activeTweenLastPosition = nil
-local activeTweenLastProgress = 0
-
-local function CancelMoveTween()
-    local tween = globalEnv.AutoFactoryTween
-    globalEnv.AutoFactoryTween = nil
-    activeTweenTarget = nil
-    activeTweenPurpose = nil
-    activeTweenLastPosition = nil
-    activeTweenLastProgress = 0
-    if tween then
-        pcall(function() tween:Cancel() end)
-    end
-end
-
 local function StopRootVelocity(hrp)
     if not hrp then return end
     pcall(function()
-        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
     end)
+end
+
+-- Cơ chế di chuyển thay thế lấy từ teleport_islands.lua: tiến từng Heartbeat,
+-- khóa velocity và noclip trong suốt hành trình để tránh bị kéo lùi.
+local moveState = {
+    active = false,
+    target = nil,
+    purpose = nil,
+    snapDistance = 0,
+    speed = 0,
+    collisionState = {},
+    floatForce = nil,
+}
+
+local function MarkTeleporting()
+    pcall(function()
+        if not CollectionService:HasTag(lp, "Teleporting") then
+            CollectionService:AddTag(lp, "Teleporting")
+        end
+    end)
+    task.delay(1.5, function()
+        pcall(function()
+            CollectionService:RemoveTag(lp, "Teleporting")
+        end)
+    end)
+end
+
+local function EnsureMoveFloat(hrp)
+    if not hrp then return end
+    if moveState.floatForce and moveState.floatForce.Parent == hrp then return end
+    if moveState.floatForce then
+        pcall(function() moveState.floatForce:Destroy() end)
+        moveState.floatForce = nil
+    end
+
+    -- Dọn lực mồ côi nếu phiên trước bị executor dừng đột ngột.
+    local staleForce = hrp:FindFirstChild("AutoFactoryFloatForce")
+    if staleForce then pcall(function() staleForce:Destroy() end) end
+
+    local force = Instance.new("BodyVelocity")
+    force.Name = "AutoFactoryFloatForce"
+    force.Velocity = Vector3.zero
+    force.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+    force.P = 1e4
+    force.Parent = hrp
+    moveState.floatForce = force
+end
+
+local function RestoreMoveCharacter()
+    globalEnv.noclip = false
+
+    local force = moveState.floatForce
+    moveState.floatForce = nil
+    if force then pcall(function() force:Destroy() end) end
+
+    local hrp = GetHRP()
+    local humanoid = GetHumanoid()
+    if hrp then
+        StopRootVelocity(hrp)
+    end
+    if humanoid then humanoid.PlatformStand = false end
+
+    for part, oldCanCollide in pairs(moveState.collisionState) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = oldCanCollide end)
+        end
+    end
+    table.clear(moveState.collisionState)
+end
+
+local function CancelMove(restoreCharacter)
+    moveState.active = false
+    moveState.target = nil
+    moveState.purpose = nil
+    moveState.snapDistance = 0
+    moveState.speed = 0
+    if restoreCharacter then RestoreMoveCharacter() end
+end
+
+local function LeaveSeat(hrp, humanoid)
+    CancelMove(true)
+    pcall(function()
+        VIM:SendKeyEvent(true, "Space", false, game)
+        task.wait()
+        VIM:SendKeyEvent(false, "Space", false, game)
+    end)
+    humanoid.Sit = false
+    humanoid.Jump = true
+    task.wait(0.1)
+    if hrp.Parent then hrp.CFrame = hrp.CFrame * CFrame.new(0, 10, 0) end
 end
 
 local function ToTarget(cf, shortSnap, purpose)
@@ -324,9 +397,7 @@ local function ToTarget(cf, shortSnap, purpose)
     end
 
     if humanoid.Sit then
-        CancelMoveTween()
-        humanoid.Sit = false
-        humanoid.Jump = true
+        LeaveSeat(hrp, humanoid)
         return false, "Đang thoát trạng thái ngồi"
     end
 
@@ -340,71 +411,110 @@ local function ToTarget(cf, shortSnap, purpose)
     local snapDistance = shortSnap and CFG.FruitSnapDistance or CFG.CoreSnapDistance
 
     if distance <= snapDistance then
-        CancelMoveTween()
+        CancelMove(false)
         local ok, err = pcall(function()
+            MarkTeleporting()
             StopRootVelocity(hrp)
             hrp.CFrame = cf
             StopRootVelocity(hrp)
         end)
-        if not ok then return false, "Snap CFrame lỗi: " .. tostring(err) end
+        if not ok then
+            RestoreMoveCharacter()
+            return false, "Snap CFrame lỗi: " .. tostring(err)
+        end
+        RestoreMoveCharacter()
         return true, "Snap"
     end
 
-    local activeTween = globalEnv.AutoFactoryTween
-    if activeTween and activeTweenTarget then
-        local targetOk, sameTarget = pcall(function()
-            return (activeTweenTarget.Position - cf.Position).Magnitude < 1
-        end)
-        local stateOk, isPlaying = pcall(function()
-            return activeTween.PlaybackState == Enum.PlaybackState.Playing
-        end)
-        if targetOk and sameTarget and activeTweenPurpose == purpose and stateOk and isPlaying then
-            local now = tick()
-            local movedOk, movedDistance = pcall(function()
-                if not activeTweenLastPosition then return math.huge end
-                return (hrp.Position - activeTweenLastPosition).Magnitude
-            end)
-            if movedOk and movedDistance >= CFG.MoveProgressEpsilon then
-                activeTweenLastPosition = hrp.Position
-                activeTweenLastProgress = now
-                return true, "Tween"
+    local configuredSpeed = purpose == "Fruit" and CFG.FruitMoveSpeed or CFG.MoveSpeed
+    local moveSpeed = math.max(tonumber(configuredSpeed) or CFG.MoveSpeed, 1)
+
+    -- Core có thể đổi vị trí liên tục. Cập nhật đích của hành trình hiện tại thay
+    -- vì khởi động lại chuyển động ở mỗi vòng lặp.
+    if moveState.active and moveState.purpose == purpose then
+        moveState.target = cf
+        moveState.snapDistance = snapDistance
+        moveState.speed = moveSpeed
+        return true, "Move"
+    end
+
+    CancelMove(false)
+    globalEnv.noclip = true
+    EnsureMoveFloat(hrp)
+    humanoid.PlatformStand = true
+    MarkTeleporting()
+    StopRootVelocity(hrp)
+    moveState.active = true
+    moveState.target = cf
+    moveState.purpose = purpose
+    moveState.snapDistance = snapDistance
+    moveState.speed = moveSpeed
+    return true, "Move"
+end
+
+TrackConnection(RunService.Heartbeat, function(dt)
+    if not moveState.active then return end
+    if not globalEnv.AutoFactory or globalEnv.AutoFactoryRunToken ~= runToken then
+        CancelMove(true)
+        return
+    end
+
+    local hrp = GetHRP()
+    local humanoid = GetHumanoid()
+    local targetCF = moveState.target
+    if not hrp or not humanoid or humanoid.Health <= 0 or not targetCF then
+        CancelMove(true)
+        return
+    end
+
+    local currentPos = hrp.Position
+    local targetPos = targetCF.Position
+    local offset = targetPos - currentPos
+    local remaining = offset.Magnitude
+
+    if remaining <= moveState.snapDistance then
+        hrp.CFrame = targetCF
+        StopRootVelocity(hrp)
+        CancelMove(true)
+        return
+    end
+
+    -- Heartbeat truyền dt trực tiếp; giới hạn dt để một frame lag không tạo bước nhảy quá lớn.
+    local frameTime = math.min(math.max(tonumber(dt) or (1 / 60), 0), 0.1)
+    local step = math.min(moveState.speed * frameTime, remaining)
+    local newPos = currentPos + offset.Unit * step
+    local targetRotation = targetCF - targetPos
+
+    globalEnv.noclip = true
+    humanoid.PlatformStand = true
+    EnsureMoveFloat(hrp)
+    hrp.CFrame = CFrame.new(newPos) * targetRotation
+    StopRootVelocity(hrp)
+end)
+
+TrackConnection(RunService.Stepped, function()
+    if not moveState.active then return end
+    local char = GetChar()
+    if not char then return end
+
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if moveState.collisionState[part] == nil then
+                moveState.collisionState[part] = part.CanCollide
             end
-            if movedOk and (now - activeTweenLastProgress) < CFG.MoveStallTimeout then
-                return true, "Tween"
-            end
-            Log("Move tween stalled; recreating tween")
+            part.CanCollide = false
         end
     end
+end)
 
-    CancelMoveTween()
-    StopRootVelocity(hrp)
-    local configuredSpeed = purpose == "Fruit" and CFG.FruitTweenSpeed or CFG.TweenSpeed
-    local moveSpeed = math.max(tonumber(configuredSpeed) or CFG.TweenSpeed, 1)
-    local duration = math.max(distance / moveSpeed, CFG.LoopDelay)
-    local ok, tweenOrError = pcall(function()
-        return TweenService:Create(
-            hrp,
-            TweenInfo.new(duration, Enum.EasingStyle.Linear),
-            { CFrame = cf }
-        )
-    end)
-    if not ok or not tweenOrError then
-        return false, "Tạo tween lỗi: " .. tostring(tweenOrError)
-    end
+TrackConnection(lp.CharacterAdded, function()
+    CancelMove(true)
+end)
 
-    globalEnv.AutoFactoryTween = tweenOrError
-    activeTweenTarget = cf
-    activeTweenPurpose = purpose
-    activeTweenLastPosition = hrp.Position
-    activeTweenLastProgress = tick()
-    local playOk, playError = pcall(function() tweenOrError:Play() end)
-    if not playOk then
-        CancelMoveTween()
-        return false, "Chạy tween lỗi: " .. tostring(playError)
-    end
-
-    return true, "Tween"
+local moveCleanup = function()
+    CancelMove(true)
 end
+globalEnv.AutoFactoryMoveCleanup = moveCleanup
 
 -- Tắt collision mob để xuyên qua (từ sizepart gốc dòng 34511-34551)
 local function SizePart(mob)
@@ -553,7 +663,7 @@ end
 -- NHẶT FRUIT
 -- Từ gốc dòng 5565-5588:
 --   - Nếu đã gần fruit (<=5 studs) → nhảy Space (trigger touch pickup)
---   - Nếu còn xa → tele đến Handle.CFrame
+--   - Nếu còn xa → tele đến Handle.CFrame bằng cơ chế Heartbeat
 -- ─────────────────────────────────────────────
 local function PickupFruit(fruit)
     if not fruit then return false, "Fruit không tồn tại" end
@@ -753,6 +863,132 @@ local function StoreFruitInBackpack()
 end
 
 -- ─────────────────────────────────────────────
+-- RANDOM DEVIL FRUIT (Cousin)
+-- Từ source gốc dòng 12294-12368 và vòng gọi dòng 40796-40833:
+--   BannerClient -> BoxName -> Cousin/Check -> CheckTime -> Cousin/Buy
+-- ─────────────────────────────────────────────
+local bannerClient = nil
+local spinnerController = nil
+
+local function GetCommF()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    return remotes and remotes:FindFirstChild("CommF_") or nil
+end
+
+local function LoadBannerClient()
+    if bannerClient then return bannerClient end
+    local controllers = ReplicatedStorage:FindFirstChild("Controllers")
+    local module = controllers and controllers:FindFirstChild("BannerClient")
+    if not module then return nil, "Không tìm thấy BannerClient" end
+
+    local ok, result = pcall(require, module)
+    if not ok or type(result) ~= "table" then
+        return nil, "Load BannerClient lỗi: " .. tostring(result)
+    end
+    bannerClient = result
+    return bannerClient
+end
+
+local function GetRandomFruitBoxName()
+    local controller, loadError = LoadBannerClient()
+    if not controller then return nil, loadError end
+    if type(controller.TryGetBannerItemIfActiveAsync) ~= "function" then
+        return nil, "BannerClient thiếu TryGetBannerItemIfActiveAsync"
+    end
+
+    local ok, item = pcall(function()
+        -- Source gốc gọi bằng dấu chấm, không truyền self.
+        return controller.TryGetBannerItemIfActiveAsync()
+    end)
+    if not ok then return nil, "Đọc banner lỗi: " .. tostring(item) end
+
+    -- Source gốc dùng DLCBoxData khi banner hiện tại không có BoxName.
+    if item and type(item.BoxName) == "string" and item.BoxName ~= "" then
+        return item.BoxName, item
+    end
+    return "DLCBoxData", item
+end
+
+local function LoadSpinnerController()
+    if spinnerController then return spinnerController end
+    local controllers = ReplicatedStorage:FindFirstChild("Controllers")
+    local ui = controllers and controllers:FindFirstChild("UI")
+    local module = ui and ui:FindFirstChild("Spinner")
+    if not module then return nil, "Không tìm thấy Spinner controller" end
+
+    local ok, result = pcall(require, module)
+    if not ok or type(result) ~= "table" then
+        return nil, "Load Spinner lỗi: " .. tostring(result)
+    end
+    spinnerController = result
+    return spinnerController
+end
+
+local function CloseRandomFruitSpinner(spinnerWindow)
+    if not spinnerWindow or not spinnerWindow.Enabled then return true end
+
+    local closeButton = spinnerWindow:FindFirstChild("CloseButton", true)
+    if closeButton and closeButton:IsA("GuiObject") and not closeButton.Visible then
+        return false, "Spinner đang quay"
+    end
+
+    local controller, loadError = LoadSpinnerController()
+    if not controller then return false, loadError end
+    if type(controller.Close) ~= "function" then
+        return false, "Spinner controller thiếu Close"
+    end
+
+    local ok, closeError = pcall(function() controller:Close() end)
+    if not ok then return false, "Đóng Spinner lỗi: " .. tostring(closeError) end
+    return true
+end
+
+local function RandomFruit()
+    local playerGui = lp:FindFirstChild("PlayerGui")
+    local spinnerWindow = playerGui and playerGui:FindFirstChild("SpinnerWindow")
+
+    -- Source gốc đợi SpinnerWindow tồn tại; khi vòng quay mở thì đóng nó trước.
+    if not spinnerWindow then return false, "SpinnerNotReady" end
+    if spinnerWindow.Enabled then
+        local closed, closeStatus = CloseRandomFruitSpinner(spinnerWindow)
+        return false, closed and "SpinnerClosed" or closeStatus
+    end
+
+    local commF = GetCommF()
+    if not commF then return false, "Không tìm thấy CommF_" end
+
+    local boxName, boxError = GetRandomFruitBoxName()
+    if not boxName then return false, boxError end
+
+    local checkOk, money, level, price = pcall(function()
+        return commF:InvokeServer("Cousin", "Check", boxName)
+    end)
+    if not checkOk then return false, "Cousin Check lỗi: " .. tostring(money) end
+
+    level = tonumber(level) or 0
+    if level < 50 then return false, "Level" end
+
+    money = tonumber(money) or 0
+    price = tonumber(price) or math.huge
+    if money < price then return false, "Money", price - money end
+
+    local timeOk, canBuy = pcall(function()
+        return commF:InvokeServer("Cousin", "CheckTime", boxName)
+    end)
+    if not timeOk then return false, "Cousin CheckTime lỗi: " .. tostring(canBuy) end
+    if canBuy ~= true then return false, "Cooldown" end
+
+    local buyOk, resultCode, reward = pcall(function()
+        return commF:InvokeServer("Cousin", boxName)
+    end)
+    if not buyOk then return false, "Cousin Buy lỗi: " .. tostring(resultCode) end
+    if resultCode ~= 1 then return false, "BuyRejected", resultCode end
+
+    Log("Random Fruit thành công: " .. tostring(reward or boxName))
+    return true, "Bought", reward or boxName
+end
+
+-- ─────────────────────────────────────────────
 -- GUI
 -- ─────────────────────────────────────────────
 -- Xóa GUI cũ
@@ -769,7 +1005,7 @@ sg.Parent          = playerGui
 -- Frame chính
 local frame = Instance.new("Frame")
 frame.Name              = "Main"
-frame.Size              = UDim2.new(0, 310, 0, 140)
+frame.Size              = UDim2.new(0, 310, 0, 165)
 frame.Position          = UDim2.new(0.5, -155, 0, 8)
 frame.BackgroundColor3  = Color3.fromRGB(10, 10, 18)
 frame.BorderSizePixel   = 0
@@ -834,7 +1070,7 @@ TrackConnection(stopBtn.MouseButton1Click, function()
     globalEnv.AutoFactory = false
 end)
 
--- Labels trạng thái (4 dòng)
+-- Labels trạng thái (5 dòng)
 local function MakeLabel(yOffset, color)
     local lbl = Instance.new("TextLabel")
     lbl.Size               = UDim2.new(1, -20, 0, 22)
@@ -852,11 +1088,14 @@ local lblMode   = MakeLabel(42,  Color3.fromRGB(100, 220, 255))
 local lblBoss   = MakeLabel(65,  Color3.fromRGB(255, 130, 130))
 local lblFruit  = MakeLabel(88,  Color3.fromRGB(130, 255, 150))
 local lblStore  = MakeLabel(111, Color3.fromRGB(200, 200, 100))
+local lblRandom = MakeLabel(134, Color3.fromRGB(220, 150, 255))
 
 lblMode.Text  = "⚙️ Khởi động..."
 lblBoss.Text  = "🔍 Boss: Chờ..."
 lblFruit.Text = "🍎 Fruit: Chờ..."
 lblStore.Text = "📦 Storage: Sẵn sàng"
+lblRandom.Text = CFG.AutoRandomFruit and "🎲 Random Fruit: Khởi động..."
+    or "🎲 Random Fruit: Đã tắt"
 
 -- Drag GUI
 local dragging, dragStart, startPos = false, nil, nil
@@ -880,10 +1119,44 @@ TrackConnection(UserInputService.InputEnded, function(inp)
     if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
 end)
 
+-- Random Fruit chạy riêng để InvokeServer/Spinner không làm chậm vòng ưu tiên Core.
+task.spawn(function()
+    while globalEnv.AutoFactory
+        and globalEnv.AutoFactoryRunToken == runToken
+        and sg.Parent do
+        task.wait(math.max(tonumber(CFG.RandomFruitInterval) or 0.5, 0.2))
+
+        if CFG.AutoRandomFruit then
+            local callOk, bought, status, detail = pcall(RandomFruit)
+            if not callOk then
+                lblRandom.Text = "⚠️ Random lỗi: " .. tostring(bought)
+            elseif bought then
+                lblRandom.Text = "✅ Random: " .. tostring(detail or "Đã mua Fruit")
+            elseif status == "Level" then
+                lblRandom.Text = "🎲 Random: Cần cấp 50"
+            elseif status == "Money" then
+                lblRandom.Text = string.format("🎲 Random: Thiếu %.0f Beli", tonumber(detail) or 0)
+            elseif status == "Cooldown" then
+                lblRandom.Text = "🎲 Random: Đang chờ cooldown"
+            elseif status == "SpinnerClosed" then
+                lblRandom.Text = "🎲 Random: Đã đóng vòng quay"
+            elseif status == "SpinnerNotReady" then
+                lblRandom.Text = "🎲 Random: Chờ SpinnerWindow"
+            elseif status == "BuyRejected" then
+                lblRandom.Text = "⚠️ Random bị từ chối: " .. tostring(detail)
+            else
+                lblRandom.Text = "⚠️ Random: " .. tostring(status or "Không thực hiện được")
+            end
+        else
+            lblRandom.Text = "🎲 Random Fruit: Đã tắt"
+        end
+    end
+end)
+
 -- ─────────────────────────────────────────────
 -- MAIN LOOP
 -- ─────────────────────────────────────────────
-print("[AutoFactory] Đã bắt đầu! Core dùng Melee-only; Fruit chỉ xử lý khi không có Core.")
+print("[AutoFactory] Đã bắt đầu! Core Melee-only; Fruit tele 150; Auto Random Fruit.")
 
 task.spawn(function()
     local ok, runError = xpcall(function()
@@ -965,7 +1238,7 @@ task.spawn(function()
         -- ══════════════════════════════════════
         -- PHẦN 2: LƯU + TÌM FRUIT (chỉ khi không có Core)
         -- ══════════════════════════════════════
-        if activeTweenPurpose == "Core" then CancelMoveTween() end
+        if moveState.purpose == "Core" then CancelMove(true) end
         waitTick = waitTick + 1
         local dots = string.rep(".", (waitTick % 3) + 1)
         lblMode.Text = "🔍 Tìm Core" .. dots
@@ -1009,7 +1282,7 @@ task.spawn(function()
                 local picked, pickupStatus = PickupFruit(fruit)
                 if picked then
                     lblFruit.Text = "✅ Đã nhặt: " .. fruitName
-                elseif pickupStatus == "Tween" or pickupStatus == "Snap"
+                elseif pickupStatus == "Move" or pickupStatus == "Snap"
                     or pickupStatus == "Chưa nhặt được" then
                     lblFruit.Text = "🍎 Đang tiếp cận: " .. fruitName
                 else
@@ -1037,7 +1310,10 @@ task.spawn(function()
         return tostring(err)
     end)
 
-    CancelMoveTween()
+    CancelMove(true)
+    if globalEnv.AutoFactoryMoveCleanup == moveCleanup then
+        globalEnv.AutoFactoryMoveCleanup = nil
+    end
     for _, connection in ipairs(connections) do
         pcall(function() connection:Disconnect() end)
     end
@@ -1052,6 +1328,7 @@ task.spawn(function()
             lblBoss.Text  = ""
             lblFruit.Text = ""
             lblStore.Text = ""
+            lblRandom.Text = ""
             print("[AutoFactory] Đã dừng.")
             task.wait(2.5)
         else
@@ -1059,6 +1336,7 @@ task.spawn(function()
             lblBoss.Text  = tostring(runError)
             lblFruit.Text = ""
             lblStore.Text = ""
+            lblRandom.Text = ""
             warn("[AutoFactory] " .. tostring(runError))
             task.wait(6)
         end
