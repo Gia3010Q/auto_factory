@@ -10,6 +10,7 @@
     ✅ Auto tìm Fruit rơi trong map
     ✅ Auto tele đến Fruit và nhặt
     ✅ Auto lưu Fruit vừa nhặt vào Storage
+    ✅ Anti-AFK, tránh bị kick khi treo máy
     ✅ GUI đẹp có thể kéo, nút STOP, hiện trạng thái
 
     CÁCH DÙNG:
@@ -26,6 +27,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService      = game:GetService("TweenService")
 local UserInputService  = game:GetService("UserInputService")
 local VIM               = game:GetService("VirtualInputManager")
+local VirtualUser       = game:GetService("VirtualUser")
 
 local lp = Players.LocalPlayer
 
@@ -43,16 +45,20 @@ local CFG = {
     TweenSpeed        = 300,  -- Speed Tween gốc mặc định 300 studs/s
     CoreSnapDistance  = 150,  -- toTarget(cf): snap khi đã gần
     FruitSnapDistance = 8,    -- toTarget(cf, true): ngưỡng gốc
+    MoveStallTimeout  = 1.5,  -- Tạo lại tween nếu không tiến thêm trong thời gian này
+    MoveProgressEpsilon = 2,  -- Số studs tối thiểu được tính là đang di chuyển
 
     -- Fruit
     FruitEnabled  = true,   -- Bật/tắt tính năng tìm fruit
-    FruitRange    = 2000,   -- Tầm tìm fruit (studs) - rộng để quét toàn map
+    FruitRange    = 0,      -- <= 0: không giới hạn, quét mọi Fruit trong cùng Sea
+    FruitTweenSpeed = 450,  -- Fruit xa: tween nhanh, tránh CFrame jump bị server kéo lùi
     PickupDist    = 5,       -- Khoảng cách nhặt (phải đứng gần bao nhiêu)
     AutoStore     = true,   -- Tự lưu Fruit vật phẩm đang giữ
     StoreCooldown = 3,      -- Khoảng nghỉ giữa các lần thử lưu (giây)
 
     -- Combat: chỉ dùng Fighting Style, không fallback vũ khí khác
     AutoEquipMelee = true,
+    AntiAFK        = true,
     Debug          = false,
 }
 
@@ -87,6 +93,43 @@ globalEnv.AutoFactory = true
 -- ─────────────────────────────────────────────
 local function Log(msg)
     if CFG.Debug then print("[AutoFactory] " .. tostring(msg)) end
+end
+
+-- Roblox phát Idled trước khi kick vì không hoạt động. Kết nối này được đưa vào
+-- AutoFactoryConnections nên chạy lại script không tạo nhiều anti-AFK song song.
+local function SendAntiAFKInput()
+    local camera = workspace.CurrentCamera
+    local cameraCFrame = camera and camera.CFrame or CFrame.new()
+
+    local downOk = pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:Button2Down(Vector2.new(0, 0), cameraCFrame)
+    end)
+    task.wait(0.1)
+    local upOk = pcall(function()
+        VirtualUser:Button2Up(Vector2.new(0, 0), cameraCFrame)
+    end)
+
+    if downOk and upOk then return true end
+
+    -- Một số executor không hỗ trợ đầy đủ VirtualUser; dùng phím làm fallback.
+    local fallbackOk = pcall(function()
+        VIM:SendKeyEvent(true, "LeftControl", false, game)
+        task.wait(0.05)
+        VIM:SendKeyEvent(false, "LeftControl", false, game)
+    end)
+    return fallbackOk
+end
+
+if CFG.AntiAFK then
+    TrackConnection(lp.Idled, function()
+        if not globalEnv.AutoFactory or globalEnv.AutoFactoryRunToken ~= runToken then
+            return
+        end
+        task.spawn(function()
+            Log(SendAntiAFKInput() and "Anti-AFK input sent" or "Anti-AFK input failed")
+        end)
+    end)
 end
 
 local function GetChar()  return lp.Character end
@@ -245,15 +288,27 @@ end
 -- Tham số shortSnap khớp cách source gọi toTarget(fruit.Handle.CFrame, true).
 local activeTweenTarget = nil
 local activeTweenPurpose = nil
+local activeTweenLastPosition = nil
+local activeTweenLastProgress = 0
 
 local function CancelMoveTween()
     local tween = globalEnv.AutoFactoryTween
     globalEnv.AutoFactoryTween = nil
     activeTweenTarget = nil
     activeTweenPurpose = nil
+    activeTweenLastPosition = nil
+    activeTweenLastProgress = 0
     if tween then
         pcall(function() tween:Cancel() end)
     end
+end
+
+local function StopRootVelocity(hrp)
+    if not hrp then return end
+    pcall(function()
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+    end)
 end
 
 local function ToTarget(cf, shortSnap, purpose)
@@ -287,7 +342,9 @@ local function ToTarget(cf, shortSnap, purpose)
     if distance <= snapDistance then
         CancelMoveTween()
         local ok, err = pcall(function()
+            StopRootVelocity(hrp)
             hrp.CFrame = cf
+            StopRootVelocity(hrp)
         end)
         if not ok then return false, "Snap CFrame lỗi: " .. tostring(err) end
         return true, "Snap"
@@ -302,12 +359,28 @@ local function ToTarget(cf, shortSnap, purpose)
             return activeTween.PlaybackState == Enum.PlaybackState.Playing
         end)
         if targetOk and sameTarget and activeTweenPurpose == purpose and stateOk and isPlaying then
-            return true, "Tween"
+            local now = tick()
+            local movedOk, movedDistance = pcall(function()
+                if not activeTweenLastPosition then return math.huge end
+                return (hrp.Position - activeTweenLastPosition).Magnitude
+            end)
+            if movedOk and movedDistance >= CFG.MoveProgressEpsilon then
+                activeTweenLastPosition = hrp.Position
+                activeTweenLastProgress = now
+                return true, "Tween"
+            end
+            if movedOk and (now - activeTweenLastProgress) < CFG.MoveStallTimeout then
+                return true, "Tween"
+            end
+            Log("Move tween stalled; recreating tween")
         end
     end
 
     CancelMoveTween()
-    local duration = math.max(distance / math.max(CFG.TweenSpeed, 1), CFG.LoopDelay)
+    StopRootVelocity(hrp)
+    local configuredSpeed = purpose == "Fruit" and CFG.FruitTweenSpeed or CFG.TweenSpeed
+    local moveSpeed = math.max(tonumber(configuredSpeed) or CFG.TweenSpeed, 1)
+    local duration = math.max(distance / moveSpeed, CFG.LoopDelay)
     local ok, tweenOrError = pcall(function()
         return TweenService:Create(
             hrp,
@@ -322,6 +395,8 @@ local function ToTarget(cf, shortSnap, purpose)
     globalEnv.AutoFactoryTween = tweenOrError
     activeTweenTarget = cf
     activeTweenPurpose = purpose
+    activeTweenLastPosition = hrp.Position
+    activeTweenLastProgress = tick()
     local playOk, playError = pcall(function() tweenOrError:Play() end)
     if not playOk then
         CancelMoveTween()
@@ -443,7 +518,9 @@ local function FindFruitInWorld()
     local hrp = GetHRP()
     if not hrp then return nil end
 
-    local bestFruit, bestDist = nil, CFG.FruitRange
+    local configuredRange = tonumber(CFG.FruitRange) or 0
+    local bestFruit = nil
+    local bestDist = configuredRange > 0 and configuredRange or math.huge
 
     local function considerFruit(obj)
         if not obj or obj.Parent ~= workspace then return end
@@ -457,7 +534,7 @@ local function FindFruitInWorld()
         if not handle or not handle:IsA("BasePart") then return end
 
         local dist = (hrp.Position - handle.Position).Magnitude
-        if dist < bestDist then
+        if dist <= bestDist then
             bestDist = dist
             bestFruit = obj
         end
