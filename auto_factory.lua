@@ -44,14 +44,13 @@ local CFG = {
     M1HoldTime    = 0.05,   -- Thời gian giữ chuột cho mỗi đòn Melee
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     RemoteAttackDelay = 0.12,
-    MoveSpeed         = 300,  -- Tốc độ di chuyển tới Core (studs/s)
+    MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     CoreSnapDistance  = 150,  -- toTarget(cf): snap khi đã gần
     FruitSnapDistance = 8,    -- toTarget(cf, true): ngưỡng gốc
 
     -- Fruit
     FruitEnabled  = true,   -- Bật/tắt tính năng tìm fruit
     FruitRange    = 0,      -- <= 0: không giới hạn, quét mọi Fruit trong cùng Sea
-    FruitMoveSpeed = 150,  -- Tốc độ di chuyển tới Fruit (studs/s)
     PickupDist    = 5,       -- Khoảng cách nhặt (phải đứng gần bao nhiêu)
     AutoStore     = true,   -- Tự lưu Fruit vật phẩm đang giữ
     StoreCooldown = 3,      -- Khoảng nghỉ giữa các lần thử lưu (giây)
@@ -426,8 +425,7 @@ local function ToTarget(cf, shortSnap, purpose)
         return true, "Snap"
     end
 
-    local configuredSpeed = purpose == "Fruit" and CFG.FruitMoveSpeed or CFG.MoveSpeed
-    local moveSpeed = math.max(tonumber(configuredSpeed) or CFG.MoveSpeed, 1)
+    local moveSpeed = math.max(tonumber(CFG.MoveSpeed) or 300, 1)
 
     -- Core có thể đổi vị trí liên tục. Cập nhật đích của hành trình hiện tại thay
     -- vì khởi động lại chuyển động ở mỗi vòng lặp.
@@ -1156,7 +1154,10 @@ end)
 -- ─────────────────────────────────────────────
 -- MAIN LOOP
 -- ─────────────────────────────────────────────
-print("[AutoFactory] Đã bắt đầu! Core Melee-only; Fruit tele 150; Auto Random Fruit.")
+print(string.format(
+    "[AutoFactory] Đã bắt đầu! Core Melee-only; tốc độ di chuyển %d; Auto Random Fruit.",
+    math.max(tonumber(CFG.MoveSpeed) or 300, 1)
+))
 
 task.spawn(function()
     local ok, runError = xpcall(function()
