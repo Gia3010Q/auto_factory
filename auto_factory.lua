@@ -525,8 +525,16 @@ end
 -- ĐẾM FRUIT VẬT PHẨM ĐANG GIỮ
 -- Đếm số fruit đang trong Backpack + Character
 -- ─────────────────────────────────────────────
+local ignoredStoreItems = setmetatable({}, { __mode = "k" })
+local fullFruitStorage = {}
+
+local function IsStoreIgnored(item)
+    return ignoredStoreItems[item] == true
+        or (item and item:FindFirstChild("Ignored") ~= nil)
+end
+
 local function CountFruitInBackpack()
-    local count = 0
+    local count, ignored = 0, 0
     local char  = GetChar()
     local bp    = lp:FindFirstChild("Backpack")
 
@@ -535,14 +543,18 @@ local function CountFruitInBackpack()
         for _, item in ipairs(container:GetChildren()) do
             local ok, isFruit = pcall(IsFruitTool, item)
             if ok and isFruit then
-                count = count + 1
+                if IsStoreIgnored(item) then
+                    ignored = ignored + 1
+                else
+                    count = count + 1
+                end
             end
         end
     end
 
     checkContainer(bp)
     if char then checkContainer(char) end
-    return count
+    return count, ignored
 end
 
 -- ─────────────────────────────────────────────
@@ -569,10 +581,25 @@ local function GetFruitStorageName(item)
     return baseName .. "-" .. baseName
 end
 
+local function MarkFruitStoreIgnored(item, storageName)
+    ignoredStoreItems[item] = true
+    fullFruitStorage[storageName] = true
+
+    -- Source gốc cũng gắn "Ignored" sau khi đã thử lưu để Tool đó
+    -- không bị gửi StoreFruit lặp lại ở các vòng sau.
+    if item and item.Parent and not item:FindFirstChild("Ignored") then
+        pcall(function()
+            local ignored = Instance.new("IntValue")
+            ignored.Name = "Ignored"
+            ignored.Parent = item
+        end)
+    end
+end
+
 local function StoreFruitInBackpack()
     -- Cooldown để không spam
     if (tick() - lastStoreTime) < CFG.StoreCooldown then
-        return 0, 0, "cooldown"
+        return 0, 0, 0, "cooldown"
     end
 
     local char = GetChar()
@@ -582,11 +609,12 @@ local function StoreFruitInBackpack()
     if commF then commF = commF:FindFirstChild("CommF_") end
     if not commF then
         Log("StoreFruit: CommF_ not found!")
-        return 0, 0, "Không tìm thấy CommF_"
+        return 0, 0, 0, "Không tìm thấy CommF_"
     end
 
     local stored = 0
     local attempted = 0
+    local skipped = 0
     lastStoreTime = tick()
 
     local function storeFrom(container)
@@ -602,17 +630,39 @@ local function StoreFruitInBackpack()
                     continue
                 end
 
+                -- Khi server đã từ chối một loại Fruit vì kho loại đó đầy,
+                -- bỏ qua toàn bộ Tool cùng loại cho tới khi chạy lại script.
+                if fullFruitStorage[storageName] or IsStoreIgnored(item) then
+                    MarkFruitStoreIgnored(item, storageName)
+                    skipped = skipped + 1
+                    Log("Skip StoreFruit (storage full): " .. itemName)
+                    continue
+                end
+
                 attempted = attempted + 1
-                local ok, err = pcall(function()
-                    commF:InvokeServer("StoreFruit", storageName, item)
+                local ok, result = pcall(function()
+                    return commF:InvokeServer("StoreFruit", storageName, item)
                 end)
 
-                task.wait(0.15)
+                -- Cho game một khoảng ngắn để chuyển Tool ra khỏi Backpack.
+                for _ = 1, 5 do
+                    if not IsInPlayerInventory(item) then break end
+                    task.wait(0.1)
+                end
+
                 if ok and not IsInPlayerInventory(item) then
                     stored = stored + 1
                     Log("Stored: " .. itemName)
+                elseif ok then
+                    -- InvokeServer chạy thành công nhưng Tool vẫn còn: server đã
+                    -- từ chối lưu (trường hợp thường gặp là đủ số lượng loại Fruit).
+                    MarkFruitStoreIgnored(item, storageName)
+                    skipped = skipped + 1
+                    Log("Storage full/rejected, skip from now: "
+                        .. itemName .. " | " .. tostring(result))
                 else
-                    Log("StoreFruit failed: " .. itemName .. " | " .. tostring(err))
+                    -- Lỗi gọi Remote có thể chỉ là tạm thời nên chưa đánh dấu full.
+                    Log("StoreFruit failed: " .. itemName .. " | " .. tostring(result))
                 end
             end
         end
@@ -621,8 +671,8 @@ local function StoreFruitInBackpack()
     storeFrom(bp)
     if char then storeFrom(char) end
 
-    Log(string.format("Stored %d/%d fruit(s)", stored, attempted))
-    return stored, attempted
+    Log(string.format("Stored %d/%d fruit(s), skipped %d", stored, attempted, skipped))
+    return stored, attempted, skipped
 end
 
 -- ─────────────────────────────────────────────
@@ -846,11 +896,15 @@ task.spawn(function()
 
         -- Thử lưu cả Fruit còn sót trong Backpack từ lần trước.
         if CFG.AutoStore then
-            local count = CountFruitInBackpack()
+            local count, ignored = CountFruitInBackpack()
             if count > 0 then
-                local stored, attempted, storeError = StoreFruitInBackpack()
+                local stored, attempted, skipped, storeError = StoreFruitInBackpack()
                 if storeError == "cooldown" then
                     lblStore.Text = string.format("📦 Chờ lưu: %d fruit(s)", count)
+                elseif skipped > 0 and stored > 0 then
+                    lblStore.Text = string.format("✅ Lưu %d | ⏭️ Bỏ qua %d (đầy)", stored, skipped)
+                elseif skipped > 0 then
+                    lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit (kho đầy)", skipped)
                 elseif attempted > 0 and stored == attempted then
                     lblStore.Text = string.format("✅ Đã lưu %d fruit(s)", stored)
                 elseif attempted > 0 then
@@ -858,6 +912,8 @@ task.spawn(function()
                 else
                     lblStore.Text = "⚠️ " .. tostring(storeError or "Không lưu được Fruit")
                 end
+            elseif ignored > 0 then
+                lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit (kho đầy)", ignored)
             else
                 lblStore.Text = "📦 Storage: Sẵn sàng"
             end
