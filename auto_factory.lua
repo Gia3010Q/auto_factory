@@ -379,6 +379,29 @@ local function CancelMove(restoreCharacter)
     if restoreCharacter then RestoreMoveCharacter() end
 end
 
+-- Giữ nhân vật ổn định khi đã vào tầm Core mà không snap CFrame mỗi frame.
+-- BodyVelocity chỉ triệt vận tốc/rơi tự do; vị trí vẫn được server quản lý.
+local function BeginCoreHold()
+    local hrp = GetHRP()
+    local humanoid = GetHumanoid()
+    if not hrp or not humanoid or humanoid.Health <= 0 then
+        return false, "Character chưa sẵn sàng"
+    end
+
+    if moveState.purpose ~= "CoreHold"
+        or not moveState.floatForce
+        or moveState.floatForce.Parent ~= hrp then
+        CancelMove(true)
+        EnsureMoveFloat(hrp)
+        moveState.purpose = "CoreHold"
+    end
+
+    globalEnv.noclip = false
+    moveState.floatForce.Velocity = Vector3.zero
+    StopRootVelocity(hrp)
+    return true
+end
+
 local function LeaveSeat(hrp, humanoid)
     CancelMove(true)
     pcall(function()
@@ -901,6 +924,16 @@ local function GetRandomFruitBoxCandidates()
     local candidates = {}
     local controller, loadError = LoadBannerClient()
     local bannerError = loadError
+    local function addCandidate(boxName)
+        if type(boxName) ~= "string" or boxName == "" then return end
+        for _, candidate in ipairs(candidates) do
+            if candidate.name == boxName then return end
+        end
+        table.insert(candidates, {
+            name = boxName,
+            label = boxName,
+        })
+    end
 
     if controller and type(controller.TryGetBannerItemIfActiveAsync) == "function" then
         local ok, item = pcall(function()
@@ -911,11 +944,7 @@ local function GetRandomFruitBoxCandidates()
             -- Source gốc chỉ dùng DLCBoxData khi có banner item nhưng item thiếu BoxName.
             local boxName = type(item.BoxName) == "string" and item.BoxName or ""
             if boxName == "" then boxName = "DLCBoxData" end
-            table.insert(candidates, {
-                hasBox = true,
-                name = boxName,
-                label = boxName,
-            })
+            addCandidate(boxName)
         elseif not ok then
             bannerError = "Đọc banner lỗi: " .. tostring(item)
         end
@@ -923,28 +952,23 @@ local function GetRandomFruitBoxCandidates()
         bannerError = "BannerClient thiếu TryGetBannerItemIfActiveAsync"
     end
 
-    -- Một số phiên bản game dùng chữ ký Cousin cũ, không có tham số BoxName.
-    -- Đặt nó sau banner candidate và chỉ dùng khi Check trả về đủ 3 số hợp lệ.
-    table.insert(candidates, {
-        hasBox = false,
-        name = nil,
-        label = "Legacy",
-    })
+    -- ServerGachaUtil hiện tại từ chối gacha name = nil. Khi BannerClient chưa
+    -- có item (hoặc executor không require được module), dùng fallback có tên
+    -- trong source thay vì gọi chữ ký Cousin legacy không có BoxName.
+    addCandidate("DLCBoxData")
     return candidates, bannerError
 end
 
 local function InvokeCousin(commF, action, candidate)
-    if action == "Buy" then
-        if candidate.hasBox then
-            return commF:InvokeServer("Cousin", candidate.name)
-        end
-        return commF:InvokeServer("Cousin")
+    local boxName = candidate and candidate.name
+    if type(boxName) ~= "string" or boxName == "" then
+        error("Cousin cần BoxName hợp lệ")
     end
 
-    if candidate.hasBox then
-        return commF:InvokeServer("Cousin", action, candidate.name)
+    if action == "Buy" then
+        return commF:InvokeServer("Cousin", boxName)
     end
-    return commF:InvokeServer("Cousin", action)
+    return commF:InvokeServer("Cousin", action, boxName)
 end
 
 local function LoadSpinnerController()
@@ -1261,31 +1285,41 @@ task.spawn(function()
                 continue
             end
 
-            local moved, moveStatus = ToTarget(
-                bossHRP.CFrame * CFrame.new(0, CFG.CoreOffsetY, 0),
-                false,
-                "Core"
-            )
-            if not moved then
-                lblMode.Text = "⚠️ " .. tostring(moveStatus or "Không thể tới Core")
-                continue
-            end
-            SizePart(core)
-
             local hp    = math.floor(bossHumanoid.Health)
             local maxHp = math.floor(bossHumanoid.MaxHealth)
             local pct   = math.floor(hp / math.max(maxHp, 1) * 100)
-            local dist  = math.floor(DistTo(bossHRP.Position))
+            local exactDist = DistTo(bossHRP.Position)
+            local dist  = math.floor(exactDist)
 
             lblBoss.Text = string.format(
                 "💀 Core: %d/%d HP (%d%%) | %dm",
                 hp, maxHp, pct, dist
             )
 
-            if dist > CFG.AttackRange then
+            if exactDist > CFG.AttackRange then
+                local moved, moveStatus = ToTarget(
+                    bossHRP.CFrame * CFrame.new(0, CFG.CoreOffsetY, 0),
+                    false,
+                    "Core"
+                )
+                if not moved then
+                    lblMode.Text = "⚠️ " .. tostring(moveStatus or "Không thể tới Core")
+                    continue
+                end
+                SizePart(core)
                 lblMode.Text = string.format("✈️ Đang tới Core | %dm", dist)
                 continue
             end
+
+            -- Đã vào tầm đánh: ngừng Heartbeat CFrame movement và chỉ triệt vận
+            -- tốc bằng CoreHold. Nhờ vậy nhân vật không bị snap hoặc rơi rồi bay
+            -- lên lặp lại trong lúc đánh.
+            local holding, holdError = BeginCoreHold()
+            if not holding then
+                lblMode.Text = "⚠️ " .. tostring(holdError or "Không thể giữ vị trí đánh")
+                continue
+            end
+            SizePart(core)
 
             -- Không có fallback: thiếu Melee thì dừng attack và báo đúng lý do.
             local meleeName, attackError, attackMode = AttackCore(core)
@@ -1302,7 +1336,9 @@ task.spawn(function()
         -- ══════════════════════════════════════
         -- PHẦN 2: LƯU + TÌM FRUIT (chỉ khi không có Core)
         -- ══════════════════════════════════════
-        if moveState.purpose == "Core" then CancelMove(true) end
+        if moveState.purpose == "Core" or moveState.purpose == "CoreHold" then
+            CancelMove(true)
+        end
         waitTick = waitTick + 1
         local dots = string.rep(".", (waitTick % 3) + 1)
         lblMode.Text = "🔍 Tìm Core" .. dots
