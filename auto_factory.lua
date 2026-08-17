@@ -9,7 +9,7 @@
     ✅ Auto tìm & đánh boss Core (Factory Sea 2)
     ✅ Auto tìm Fruit rơi trong map
     ✅ Auto tele đến Fruit và nhặt
-    ✅ Auto Random Devil Fruit theo logic Cousin/Banner gốc
+    ✅ Auto Random Devil Fruit từ xa qua Cousin remote
     ✅ Auto lưu Fruit vừa nhặt vào Storage
     ✅ Anti-AFK, tránh bị kick khi treo máy
     ✅ GUI đẹp có thể kéo, nút STOP, hiện trạng thái
@@ -54,8 +54,8 @@ local CFG = {
     PickupDist    = 5,       -- Khoảng cách nhặt (phải đứng gần bao nhiêu)
     AutoStore     = true,   -- Tự lưu Fruit vật phẩm đang giữ
     StoreCooldown = 3,      -- Khoảng nghỉ giữa các lần thử lưu (giây)
-    AutoRandomFruit = true, -- Random Fruit từ NPC Cousin khi đủ điều kiện
-    RandomFruitInterval = 0.5, -- Chu kỳ gốc của Banana Cat Hub
+    AutoRandomFruit = true, -- Random Fruit từ xa, không cần tới NPC Cousin
+    RandomFruitInterval = 0.5, -- Chu kỳ kiểm tra remote
 
     -- Combat: chỉ dùng Fighting Style, không fallback vũ khí khác
     AutoEquipMelee = true,
@@ -894,185 +894,123 @@ local function StoreFruitInBackpack()
 end
 
 -- ─────────────────────────────────────────────
--- RANDOM DEVIL FRUIT (Cousin)
--- Từ source gốc dòng 12294-12368 và vòng gọi dòng 40796-40833:
---   BannerClient -> BoxName -> Cousin/Check -> CheckTime -> Cousin/Buy
+-- REMOTE RANDOM DEVIL FRUIT
+-- Cơ chế lấy trực tiếp từ remote_random_fruit.lua:
+--   BannerClient -> BoxName -> Cousin/Check -> CheckTime -> Cousin/BoxName
+-- Không teleport và không phụ thuộc NPC/Spinner GUI.
 -- ─────────────────────────────────────────────
 local bannerClient = nil
-local spinnerController = nil
 
 local function GetCommF()
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     return remotes and remotes:FindFirstChild("CommF_") or nil
 end
 
-local function LoadBannerClient()
-    if bannerClient then return bannerClient end
-    local controllers = ReplicatedStorage:FindFirstChild("Controllers")
-    local module = controllers and controllers:FindFirstChild("BannerClient")
-    if not module then return nil, "Không tìm thấy BannerClient" end
-
-    local ok, result = pcall(require, module)
-    if not ok or type(result) ~= "table" then
-        return nil, "Load BannerClient lỗi: " .. tostring(result)
-    end
-    bannerClient = result
-    return bannerClient
-end
-
-local function GetRandomFruitBoxCandidates()
-    local candidates = {}
-    local controller, loadError = LoadBannerClient()
-    local bannerError = loadError
-    local function addCandidate(boxName)
-        if type(boxName) ~= "string" or boxName == "" then return end
-        for _, candidate in ipairs(candidates) do
-            if candidate.name == boxName then return end
+local function GetActiveRandomFruitBoxName()
+    if not bannerClient then
+        local controllers = ReplicatedStorage:FindFirstChild("Controllers")
+        local module = controllers and controllers:FindFirstChild("BannerClient")
+        if module then
+            local ok, result = pcall(require, module)
+            if ok and type(result) == "table" then
+                bannerClient = result
+            else
+                Log("Load BannerClient lỗi: " .. tostring(result))
+            end
         end
-        table.insert(candidates, {
-            name = boxName,
-            label = boxName,
-        })
     end
 
-    if controller and type(controller.TryGetBannerItemIfActiveAsync) == "function" then
-        local ok, item = pcall(function()
-            -- Source gốc gọi bằng dấu chấm, không truyền self.
-            return controller.TryGetBannerItemIfActiveAsync()
-        end)
-        if ok and item then
-            -- Source gốc chỉ dùng DLCBoxData khi có banner item nhưng item thiếu BoxName.
-            local boxName = type(item.BoxName) == "string" and item.BoxName or ""
-            if boxName == "" then boxName = "DLCBoxData" end
-            addCandidate(boxName)
-        elseif not ok then
-            bannerError = "Đọc banner lỗi: " .. tostring(item)
+    if bannerClient
+        and type(bannerClient.TryGetBannerItemIfActiveAsync) == "function" then
+        local ok, data = pcall(bannerClient.TryGetBannerItemIfActiveAsync)
+        if ok and type(data) == "table"
+            and type(data.BoxName) == "string" and data.BoxName ~= "" then
+            return data.BoxName
         end
-    elseif controller then
-        bannerError = "BannerClient thiếu TryGetBannerItemIfActiveAsync"
+        if not ok then Log("Đọc banner lỗi: " .. tostring(data)) end
     end
 
-    -- ServerGachaUtil hiện tại từ chối gacha name = nil. Khi BannerClient chưa
-    -- có item (hoặc executor không require được module), dùng fallback có tên
-    -- trong source thay vì gọi chữ ký Cousin legacy không có BoxName.
-    addCandidate("DLCBoxData")
-    return candidates, bannerError
+    return "DLCBoxData"
 end
 
-local function InvokeCousin(commF, action, candidate)
-    local boxName = candidate and candidate.name
-    if type(boxName) ~= "string" or boxName == "" then
-        error("Cousin cần BoxName hợp lệ")
+-- remote_random_fruit.lua tự cất Fruit ngay sau khi quay thành công. Hàm này
+-- cố ý không dùng cooldown/ignored list của vòng Auto Store để Fruit mới nhận
+-- được gửi vào Storage ngay cả khi main loop vừa thử lưu trước đó.
+local function StoreRemoteRandomFruits()
+    local commF = GetCommF()
+    if not commF then return 0, "Không tìm thấy CommF_" end
+
+    local stored = 0
+    local function processContainer(container)
+        if not container then return end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and string.find(tool.Name, "Fruit", 1, true) then
+                local shortName = string.gsub(tool.Name, " Fruit", "")
+                local originalName = tool:GetAttribute("OriginalName")
+                    or (shortName .. "-" .. shortName)
+                local ok, result = pcall(function()
+                    return commF:InvokeServer("StoreFruit", originalName, tool)
+                end)
+                if ok then
+                    stored = stored + 1
+                    Log("Remote Random StoreFruit: " .. tool.Name)
+                else
+                    Log("Remote Random StoreFruit lỗi: " .. tostring(result))
+                end
+            end
+        end
     end
 
-    if action == "Buy" then
-        return commF:InvokeServer("Cousin", boxName)
-    end
-    return commF:InvokeServer("Cousin", action, boxName)
-end
-
-local function LoadSpinnerController()
-    if spinnerController then return spinnerController end
-    local controllers = ReplicatedStorage:FindFirstChild("Controllers")
-    local ui = controllers and controllers:FindFirstChild("UI")
-    local module = ui and ui:FindFirstChild("Spinner")
-    if not module then return nil, "Không tìm thấy Spinner controller" end
-
-    local ok, result = pcall(require, module)
-    if not ok or type(result) ~= "table" then
-        return nil, "Load Spinner lỗi: " .. tostring(result)
-    end
-    spinnerController = result
-    return spinnerController
-end
-
-local function CloseRandomFruitSpinner(spinnerWindow)
-    if not spinnerWindow or not spinnerWindow.Enabled then return true end
-
-    local aboveSpinner = spinnerWindow:FindFirstChild("AboveSpinner")
-    local navigation = aboveSpinner and aboveSpinner:FindFirstChild("Navigation")
-    local closeButton = navigation and navigation:FindFirstChild("CloseButton")
-    if not closeButton or not closeButton:IsA("GuiObject") then
-        return false, "Spinner đang khởi tạo"
-    end
-    if not closeButton.Visible then
-        return false, "Spinner đang quay"
-    end
-
-    local controller, loadError = LoadSpinnerController()
-    if not controller then return false, loadError end
-    if type(controller.Close) ~= "function" then
-        return false, "Spinner controller thiếu Close"
-    end
-
-    local ok, closeError = pcall(function() controller:Close() end)
-    if not ok then return false, "Đóng Spinner lỗi: " .. tostring(closeError) end
-    return true
+    processContainer(lp:FindFirstChild("Backpack"))
+    processContainer(GetChar())
+    return stored
 end
 
 local function RandomFruit()
-    local playerGui = lp:FindFirstChild("PlayerGui")
-    local spinnerWindow = playerGui and playerGui:FindFirstChild("SpinnerWindow")
-
-    -- SpinnerWindow có thể chưa được game tạo trước lần mua đầu tiên. Chỉ chờ/đóng
-    -- khi cửa sổ thực sự đang mở; không chặn Cousin remote vì thiếu GUI này.
-    if spinnerWindow and spinnerWindow.Enabled then
-        local closed, closeStatus = CloseRandomFruitSpinner(spinnerWindow)
-        return false, closed and "SpinnerClosed" or closeStatus
-    end
-
     local commF = GetCommF()
-    if not commF then return false, "Không tìm thấy CommF_" end
+    if not commF then return false, "RemoteError", "Không tìm thấy CommF_" end
 
-    local candidates, bannerError = GetRandomFruitBoxCandidates()
-    local lastCheckError = bannerError
+    local boxName = GetActiveRandomFruitBoxName()
+    Log("Remote Random kiểm tra Box: " .. boxName)
 
-    for _, candidate in ipairs(candidates) do
-        local checkOk, money, level, price = pcall(function()
-            return InvokeCousin(commF, "Check", candidate)
-        end)
-        local numericMoney = checkOk and tonumber(money) or nil
-        local numericLevel = checkOk and tonumber(level) or nil
-        local numericPrice = checkOk and tonumber(price) or nil
+    -- Giữ nguyên chữ ký và thứ tự gọi từ remote_random_fruit.lua.
+    local currentSpins, playerLevel, maxSpins = nil, nil, nil
+    pcall(function()
+        currentSpins, playerLevel, maxSpins =
+            commF:InvokeServer("Cousin", "Check", boxName)
+    end)
 
-        -- Chỉ chọn chữ ký remote khi Check trả đúng cấu trúc. Nhờ vậy fallback
-        -- legacy không bao giờ gửi lệnh Buy nếu game không hỗ trợ nó.
-        if numericMoney and numericLevel and numericPrice then
-            if numericLevel < 50 then return false, "Level" end
-            if numericMoney < numericPrice then
-                return false, "Money", numericPrice - numericMoney
-            end
-
-            local timeOk, canBuy = pcall(function()
-                return InvokeCousin(commF, "CheckTime", candidate)
-            end)
-            if not timeOk then
-                return false, "Cousin CheckTime lỗi (" .. candidate.label .. "): "
-                    .. tostring(canBuy)
-            end
-            if canBuy ~= true then return false, "Cooldown" end
-
-            local buyOk, resultCode, reward = pcall(function()
-                return InvokeCousin(commF, "Buy", candidate)
-            end)
-            if not buyOk then
-                return false, "Cousin Buy lỗi (" .. candidate.label .. "): "
-                    .. tostring(resultCode)
-            end
-            if resultCode ~= 1 then return false, "BuyRejected", resultCode end
-
-            Log("Random Fruit thành công: " .. tostring(reward or candidate.label))
-            return true, "Bought", reward or candidate.label
-        end
-
-        if checkOk then
-            lastCheckError = "Cousin Check trả dữ liệu không hợp lệ (" .. candidate.label .. ")"
-        else
-            lastCheckError = "Cousin Check lỗi (" .. candidate.label .. "): " .. tostring(money)
-        end
+    local numericLevel = tonumber(playerLevel)
+    if numericLevel and numericLevel < 50 then
+        return false, "Low Level", numericLevel
     end
 
-    return false, lastCheckError or "Không tìm được chữ ký Cousin phù hợp"
+    local isReady = nil
+    pcall(function()
+        isReady = commF:InvokeServer("Cousin", "CheckTime", boxName)
+    end)
+    if isReady == false then return false, "Cooldown" end
+
+    local result = nil
+    pcall(function()
+        result = commF:InvokeServer("Cousin", boxName)
+    end)
+
+    -- Fallback legacy cũng được giữ nguyên từ remote_random_fruit.lua.
+    if result == nil or result == false then
+        pcall(function()
+            result = commF:InvokeServer("Cousin")
+        end)
+    end
+
+    if result and result ~= false then
+        Log("Remote Random Fruit thành công: " .. tostring(result))
+        task.wait(1)
+        StoreRemoteRandomFruits()
+        return true, "Bought", boxName
+    end
+
+    return false, "BuyRejected", result
 end
 
 -- ─────────────────────────────────────────────
@@ -1206,7 +1144,7 @@ TrackConnection(UserInputService.InputEnded, function(inp)
     if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
 end)
 
--- Random Fruit chạy riêng để InvokeServer/Spinner không làm chậm vòng ưu tiên Core.
+-- Remote Random Fruit chạy riêng để InvokeServer không làm chậm vòng ưu tiên Core.
 task.spawn(function()
     while globalEnv.AutoFactory
         and globalEnv.AutoFactoryRunToken == runToken
@@ -1218,17 +1156,15 @@ task.spawn(function()
             if not callOk then
                 lblRandom.Text = "⚠️ Random lỗi: " .. tostring(bought)
             elseif bought then
-                lblRandom.Text = "✅ Random: " .. tostring(detail or "Đã mua Fruit")
-            elseif status == "Level" then
+                lblRandom.Text = "✅ Remote Random: Thành công"
+            elseif status == "Low Level" then
                 lblRandom.Text = "🎲 Random: Cần cấp 50"
-            elseif status == "Money" then
-                lblRandom.Text = string.format("🎲 Random: Thiếu %.0f Beli", tonumber(detail) or 0)
             elseif status == "Cooldown" then
                 lblRandom.Text = "🎲 Random: Đang chờ cooldown"
-            elseif status == "SpinnerClosed" then
-                lblRandom.Text = "🎲 Random: Đã đóng vòng quay"
             elseif status == "BuyRejected" then
-                lblRandom.Text = "⚠️ Random bị từ chối: " .. tostring(detail)
+                lblRandom.Text = "⚠️ Remote Random: Server từ chối"
+            elseif status == "RemoteError" then
+                lblRandom.Text = "⚠️ Remote Random: " .. tostring(detail)
             else
                 lblRandom.Text = "⚠️ Random: " .. tostring(status or "Không thực hiện được")
             end
