@@ -1672,7 +1672,7 @@ task.spawn(function()
         end
         waitTick = waitTick + 1
         local dots = string.rep(".", (waitTick % 3) + 1)
-        lblMode.Text = "🔍 Tìm Core" .. dots
+        lblMode.Text = "🔍 Chờ Core" .. dots
         lblBoss.Text = "💀 Boss: Chờ spawn..."
 
         if CFG.FruitEnabled then
