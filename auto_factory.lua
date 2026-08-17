@@ -7,6 +7,7 @@
 
     TÍNH NĂNG:
     ✅ Auto tìm & đánh boss Core (Factory Sea 2)
+    ✅ Tự bật Buso Haki khi chạy script và sau khi respawn
     ✅ Auto tìm Fruit rơi trong map
     ✅ Auto tele đến Fruit và nhặt
     ✅ Auto Random Devil Fruit từ xa qua Cousin remote
@@ -54,11 +55,17 @@ local CFG = {
     PickupDist    = 5,       -- Khoảng cách nhặt (phải đứng gần bao nhiêu)
     AutoStore     = true,   -- Tự lưu Fruit vật phẩm đang giữ
     StoreCooldown = 3,      -- Khoảng nghỉ giữa các lần thử lưu (giây)
+    StoreRetryDelay = 15,   -- Thử lại Fruit bị server từ chối/lỗi tạm thời
     AutoRandomFruit = true, -- Random Fruit từ xa, không cần tới NPC Cousin
     RandomFruitInterval = 0.5, -- Chu kỳ kiểm tra remote
 
     -- Combat: chỉ dùng Fighting Style, không fallback vũ khí khác
     AutoEquipMelee = true,
+    AutoBuso       = true,   -- Luôn giữ Buso bật, kể cả sau khi respawn
+    BusoCheckDelay = 1,      -- Chu kỳ kiểm tra khi Buso đang bật
+    BusoRetryDelay = 3,      -- Khoảng nghỉ trước khi thử lại nếu bật thất bại
+    BusoConfirmTimeout = 1.5,-- Chờ server replicate HasBuso trước khi fallback
+    UseBusoKeyFallback = true, -- Dùng phím J nếu remote không bật được Buso
     AntiAFK        = true,
     Debug          = false,
 }
@@ -67,6 +74,14 @@ local CFG = {
 -- GLOBAL SWITCH
 -- ─────────────────────────────────────────────
 local globalEnv = getgenv()
+-- Auto Factory sở hữu Auto Buso; dừng bản standalone để tránh hai loop cùng chạy.
+globalEnv.AutoHakiThread = false
+globalEnv.AutoBuso = false
+globalEnv.AutoBusoRunToken = {}
+if type(globalEnv.AutoHakiConfig) == "table" then
+    globalEnv.AutoHakiConfig.AutoBuso = false
+end
+
 if type(globalEnv.AutoFactoryMoveCleanup) == "function" then
     pcall(globalEnv.AutoFactoryMoveCleanup)
     globalEnv.AutoFactoryMoveCleanup = nil
@@ -115,9 +130,9 @@ local function SendAntiAFKInput()
 
     -- Một số executor không hỗ trợ đầy đủ VirtualUser; dùng phím làm fallback.
     local fallbackOk = pcall(function()
-        VIM:SendKeyEvent(true, "LeftControl", false, game)
+        VIM:SendKeyEvent(true, Enum.KeyCode.LeftControl, false, game)
         task.wait(0.05)
-        VIM:SendKeyEvent(false, "LeftControl", false, game)
+        VIM:SendKeyEvent(false, Enum.KeyCode.LeftControl, false, game)
     end)
     return fallbackOk
 end
@@ -143,6 +158,106 @@ local function GetHumanoid()
     return c and c:FindFirstChild("Humanoid")
 end
 
+-- Auto Buso chạy riêng để InvokeServer/thời gian xác nhận không chặn vòng combat.
+-- Loop tự nhận character mới sau respawn nên không cần CharacterAdded connection.
+local function HasBuso(character)
+    return character and character:FindFirstChild("HasBuso") ~= nil
+end
+
+local function WaitForBuso(character, timeout)
+    local deadline = tick() + math.max(tonumber(timeout) or 0, 0)
+    repeat
+        if HasBuso(character) then return true end
+        if not globalEnv.AutoFactory
+            or globalEnv.AutoFactoryRunToken ~= runToken
+            or character ~= lp.Character
+            or not character.Parent then
+            return false
+        end
+        task.wait(0.1)
+    until tick() >= deadline
+    return HasBuso(character)
+end
+
+local function PressBusoKey()
+    local ok, err = pcall(function()
+        VIM:SendKeyEvent(true, Enum.KeyCode.J, false, game)
+        task.wait(0.05)
+        VIM:SendKeyEvent(false, Enum.KeyCode.J, false, game)
+    end)
+    if not ok then
+        pcall(function()
+            VIM:SendKeyEvent(false, Enum.KeyCode.J, false, game)
+        end)
+        return false, err
+    end
+    return true
+end
+
+local function EnsureBusoEnabled()
+    local character = GetChar()
+    local humanoid = GetHumanoid()
+    local root = GetHRP()
+    if not character or not humanoid or humanoid.Health <= 0 or not root then
+        globalEnv.AutoFactoryBusoEnabled = false
+        return false, "CharacterNotReady"
+    end
+    if HasBuso(character) then
+        globalEnv.AutoFactoryBusoEnabled = true
+        return true, "AlreadyEnabled"
+    end
+
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local commF = remotes and remotes:FindFirstChild("CommF_")
+    local remoteOk, remoteError = false, "Không tìm thấy CommF_"
+    if commF then
+        remoteOk, remoteError = pcall(function()
+            return commF:InvokeServer("Buso")
+        end)
+    end
+
+    if WaitForBuso(character, CFG.BusoConfirmTimeout) then
+        globalEnv.AutoFactoryBusoEnabled = true
+        Log("Auto Buso: enabled by remote")
+        return true, "Remote"
+    end
+
+    if CFG.UseBusoKeyFallback
+        and globalEnv.AutoFactory
+        and globalEnv.AutoFactoryRunToken == runToken then
+        local keyOk, keyError = PressBusoKey()
+        if keyOk and WaitForBuso(character, 0.75) then
+            globalEnv.AutoFactoryBusoEnabled = true
+            Log("Auto Buso: enabled by J fallback")
+            return true, "KeyFallback"
+        end
+        if not keyOk then remoteError = keyError end
+    end
+
+    globalEnv.AutoFactoryBusoEnabled = false
+    return false, remoteOk and "HasBusoNotConfirmed" or tostring(remoteError)
+end
+
+task.spawn(function()
+    while globalEnv.AutoFactory and globalEnv.AutoFactoryRunToken == runToken do
+        if CFG.AutoBuso then
+            local ok, enabled, status = pcall(EnsureBusoEnabled)
+            if not ok then
+                Log("Auto Buso error: " .. tostring(enabled))
+                enabled = false
+            elseif not enabled then
+                Log("Auto Buso retry: " .. tostring(status))
+            end
+            local delay = enabled and CFG.BusoCheckDelay or CFG.BusoRetryDelay
+            task.wait(math.max(tonumber(delay) or 1, 0.1))
+        else
+            globalEnv.AutoFactoryBusoEnabled = false
+            task.wait(1)
+        end
+    end
+    globalEnv.AutoFactoryBusoEnabled = false
+end)
+
 local function IsMeleeTool(item)
     if not item or not item:IsA("Tool") then return false end
     local toolTip = string.lower(tostring(item.ToolTip or ""))
@@ -152,9 +267,10 @@ end
 local function IsFruitTool(item)
     if not item or not item:IsA("Tool") then return false end
     local itemName = string.lower(item.Name)
-    -- Không dùng ToolTip "Blox Fruit": đó có thể là Fruit power đã ăn,
-    -- không phải vật phẩm Fruit có thể cất vào Storage.
-    return string.find(itemName, "fruit", 1, true) ~= nil
+    if string.find(itemName, "fruit", 1, true) == nil then return false end
+    -- Đảm bảo đây là vật phẩm Fruit nhặt được (có Handle part), tránh nhầm với kĩ năng trái đã ăn
+    local handle = item:FindFirstChild("Handle")
+    return handle ~= nil and handle:IsA("BasePart")
 end
 
 local function FindMeleeIn(container)
@@ -263,7 +379,7 @@ local function TrySourceMeleeAttack(core)
 
     local ok, err = pcall(function()
         attackRemote:FireServer(0)
-        hitRemote:FireServer(hitPart, {})
+        hitRemote:FireServer(hitPart, { hitPart })
     end)
     if not ok then
         registerAttackRemote = nil
@@ -332,7 +448,7 @@ local function EnsureMoveFloat(hrp)
     local force = Instance.new("BodyVelocity")
     force.Name = "AutoFactoryFloatForce"
     force.Velocity = Vector3.zero
-    force.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+    force.MaxForce = Vector3.new(1e9, 1e9, 1e9)
     force.P = 1e4
     force.Parent = hrp
     moveState.floatForce = force
@@ -405,9 +521,9 @@ end
 local function LeaveSeat(hrp, humanoid)
     CancelMove(true)
     pcall(function()
-        VIM:SendKeyEvent(true, "Space", false, game)
+        VIM:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
         task.wait()
-        VIM:SendKeyEvent(false, "Space", false, game)
+        VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
     end)
     humanoid.Sit = false
     humanoid.Jump = true
@@ -517,7 +633,7 @@ TrackConnection(RunService.Heartbeat, function(dt)
     local frameTime = math.min(math.max(tonumber(dt) or (1 / 60), 0), 0.1)
     local step = math.min(moveState.speed * frameTime, remaining)
     local newPos = currentPos + offset.Unit * step
-    local targetRotation = targetCF - targetPos
+    local targetRotation = targetCF.Rotation
 
     globalEnv.noclip = true
     humanoid.PlatformStand = true
@@ -713,12 +829,14 @@ local function PickupFruit(fruit)
     if dist <= CFG.PickupDist then
         -- Đủ gần → nhảy để trigger pickup (theo gốc dùng VirtualInputManager Space)
         local inputOk, inputError = pcall(function()
-            VIM:SendKeyEvent(true, "Space", false, game)
+            VIM:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
             task.wait(0.05)
-            VIM:SendKeyEvent(false, "Space", false, game)
+            VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
         end)
         if not inputOk then
-            pcall(function() VIM:SendKeyEvent(false, "Space", false, game) end)
+            pcall(function()
+                VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+            end)
             return false, "Input nhặt Fruit lỗi: " .. tostring(inputError)
         end
         task.wait(0.3)
@@ -746,15 +864,19 @@ end
 -- ĐẾM FRUIT VẬT PHẨM ĐANG GIỮ
 -- Đếm số fruit đang trong Backpack + Character
 -- ─────────────────────────────────────────────
-local ignoredStoreItems = setmetatable({}, { __mode = "k" })
+local storeRetryAt = setmetatable({}, { __mode = "k" })
 
-local function IsStoreIgnored(item)
-    return ignoredStoreItems[item] == true
-        or (item and item:FindFirstChild("Ignored") ~= nil)
+local function IsStoreDeferred(item)
+    return item ~= nil and (storeRetryAt[item] or 0) > tick()
+end
+
+local function DeferFruitStore(item)
+    if not item then return end
+    storeRetryAt[item] = tick() + math.max(tonumber(CFG.StoreRetryDelay) or 15, 1)
 end
 
 local function CountFruitInBackpack()
-    local count, ignored = 0, 0
+    local count, deferred = 0, 0
     local char  = GetChar()
     local bp    = lp:FindFirstChild("Backpack")
 
@@ -763,8 +885,8 @@ local function CountFruitInBackpack()
         for _, item in ipairs(container:GetChildren()) do
             local ok, isFruit = pcall(IsFruitTool, item)
             if ok and isFruit then
-                if IsStoreIgnored(item) then
-                    ignored = ignored + 1
+                if IsStoreDeferred(item) then
+                    deferred = deferred + 1
                 else
                     count = count + 1
                 end
@@ -774,7 +896,7 @@ local function CountFruitInBackpack()
 
     checkContainer(bp)
     if char then checkContainer(char) end
-    return count, ignored
+    return count, deferred
 end
 
 -- ─────────────────────────────────────────────
@@ -802,29 +924,15 @@ local function GetFruitStorageName(item)
     return baseName .. "-" .. baseName
 end
 
-local function MarkFruitStoreIgnored(item)
-    ignoredStoreItems[item] = true
-
-    -- Source gốc cũng gắn "Ignored" sau khi đã thử lưu để Tool đó
-    -- không bị gửi StoreFruit lặp lại ở các vòng sau.
-    if item and item.Parent and not item:FindFirstChild("Ignored") then
-        pcall(function()
-            local ignored = Instance.new("IntValue")
-            ignored.Name = "Ignored"
-            ignored.Parent = item
-        end)
-    end
-end
-
 local function StoreFruitInBackpack(bypassCooldown)
-    -- Vòng main và vòng Remote Random có thể cùng yêu cầu lưu. Không cho hai
-    -- lượt quét chạy chồng nhau vì chúng có thể gửi StoreFruit hai lần cho cùng Tool.
+    -- Chặn các lượt quét chồng nhau để không gửi StoreFruit hai lần cho cùng Tool.
     if storeInProgress then
         return 0, 0, 0, "busy"
     end
 
     -- Cooldown để không spam
-    if not bypassCooldown and (tick() - lastStoreTime) < CFG.StoreCooldown then
+    local cooldown = math.max(tonumber(CFG.StoreCooldown) or 3, 0)
+    if not bypassCooldown and (tick() - lastStoreTime) < cooldown then
         return 0, 0, 0, "cooldown"
     end
 
@@ -857,11 +965,11 @@ local function StoreFruitInBackpack(bypassCooldown)
                     continue
                 end
 
-                -- Source gốc chỉ đánh dấu đúng Tool đã thử, không được suy ra cả
-                -- loại Fruit đã đầy vì server cũng có thể từ chối tạm thời.
-                if IsStoreIgnored(item) then
+                -- Fruit bị từ chối/lỗi chỉ được hoãn có thời hạn, không gắn
+                -- IntValue Ignored vĩnh viễn lên Tool.
+                if IsStoreDeferred(item) then
                     skipped = skipped + 1
-                    Log("Skip StoreFruit (đã thử): " .. itemName)
+                    Log("Defer StoreFruit (đang chờ retry): " .. itemName)
                     continue
                 end
 
@@ -880,14 +988,15 @@ local function StoreFruitInBackpack(bypassCooldown)
                     stored = stored + 1
                     Log("Stored: " .. itemName)
                 elseif ok then
-                    -- InvokeServer chạy thành công nhưng Tool vẫn còn: server đã
-                    -- từ chối lưu (trường hợp thường gặp là đủ số lượng loại Fruit).
-                    MarkFruitStoreIgnored(item)
+                    -- InvokeServer không ném lỗi nhưng Tool vẫn còn: có thể kho
+                    -- đầy, server chậm hoặc từ chối tạm thời. Hoãn rồi thử lại.
+                    DeferFruitStore(item)
                     skipped = skipped + 1
-                    Log("StoreFruit rejected, skip this Tool: "
+                    Log("StoreFruit rejected, retry later: "
                         .. itemName .. " | " .. tostring(result))
                 else
-                    -- Lỗi gọi Remote có thể chỉ là tạm thời nên chưa đánh dấu full.
+                    DeferFruitStore(item)
+                    skipped = skipped + 1
                     Log("StoreFruit failed: " .. itemName .. " | " .. tostring(result))
                 end
             end
@@ -958,30 +1067,32 @@ local function RandomFruit()
     local boxName = GetActiveRandomFruitBoxName()
     Log("Remote Random kiểm tra Box: " .. boxName)
 
-    -- Giữ nguyên chữ ký và thứ tự gọi từ remote_random_fruit.lua.
+    -- Logic Random Fruit cũ: chỉ chặn khi server trả rõ level thấp/cooldown false.
     local currentSpins, playerLevel, maxSpins = nil, nil, nil
     pcall(function()
-        currentSpins, playerLevel, maxSpins =
-            commF:InvokeServer("Cousin", "Check", boxName)
+        currentSpins, playerLevel, maxSpins = commF:InvokeServer(
+            "Cousin", "Check", boxName
+        )
     end)
 
-    local numericLevel = tonumber(playerLevel)
-    if numericLevel and numericLevel < 50 then
-        return false, "Low Level", numericLevel
+    if playerLevel and playerLevel < 50 then
+        return false, "Low Level", playerLevel
     end
 
     local isReady = nil
     pcall(function()
         isReady = commF:InvokeServer("Cousin", "CheckTime", boxName)
     end)
-    if isReady == false then return false, "Cooldown" end
+    if isReady == false then
+        return false, "Cooldown"
+    end
 
     local result = nil
     pcall(function()
         result = commF:InvokeServer("Cousin", boxName)
     end)
 
-    -- Fallback legacy cũng được giữ nguyên từ remote_random_fruit.lua.
+    -- Fallback cũ dành cho server/executor không nhận boxName.
     if result == nil or result == false then
         pcall(function()
             result = commF:InvokeServer("Cousin")
@@ -991,10 +1102,8 @@ local function RandomFruit()
     if result and result ~= false then
         Log("Remote Random Fruit thành công: " .. tostring(result))
         task.wait(1)
-        -- Lưu ngay nhưng vẫn dùng chung cơ chế đánh dấu Ignored. Một Tool bị
-        -- server từ chối vì kho đầy sẽ không bao giờ bị gửi StoreFruit lặp lại.
         StoreFruitInBackpack(true)
-        return true, "Bought", boxName
+        return true, "Bought", result
     end
 
     return false, "BuyRejected", result
@@ -1078,7 +1187,8 @@ end)
 TrackConnection(stopBtn.MouseLeave, function()
     stopBtn.BackgroundColor3 = Color3.fromRGB(190,40,40)
 end)
-TrackConnection(stopBtn.MouseButton1Click, function()
+-- Activated hoạt động với chuột, touch và gamepad.
+TrackConnection(stopBtn.Activated, function()
     globalEnv.AutoFactory = false
 end)
 
@@ -1109,17 +1219,25 @@ lblStore.Text = "📦 Storage: Sẵn sàng"
 lblRandom.Text = CFG.AutoRandomFruit and "🎲 Random Fruit: Khởi động..."
     or "🎲 Random Fruit: Đã tắt"
 
--- Drag GUI
-local dragging, dragStart, startPos = false, nil, nil
+-- Drag GUI bằng chuột lẫn touch (Delta/mobile).
+local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
 TrackConnection(header.InputBegan, function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+    if inp.UserInputType == Enum.UserInputType.MouseButton1
+        or inp.UserInputType == Enum.UserInputType.Touch then
         dragging  = true
+        dragInput = inp.UserInputType == Enum.UserInputType.Touch and inp or nil
         dragStart = inp.Position
         startPos  = frame.Position
     end
 end)
+TrackConnection(header.InputChanged, function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseMovement
+        or inp.UserInputType == Enum.UserInputType.Touch then
+        dragInput = inp
+    end
+end)
 TrackConnection(UserInputService.InputChanged, function(inp)
-    if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then
+    if dragging and inp == dragInput then
         local d = inp.Position - dragStart
         frame.Position = UDim2.new(
             startPos.X.Scale, startPos.X.Offset + d.X,
@@ -1128,7 +1246,61 @@ TrackConnection(UserInputService.InputChanged, function(inp)
     end
 end)
 TrackConnection(UserInputService.InputEnded, function(inp)
-    if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    if inp == dragInput or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+        dragInput = nil
+    end
+end)
+
+-- Auto Store chạy độc lập để InvokeServer/task.wait không chặn việc phát hiện Core.
+-- Khi Core đang sống, lượt lưu mới sẽ chờ để giữ đúng thứ tự ưu tiên combat.
+task.spawn(function()
+    while globalEnv.AutoFactory
+        and globalEnv.AutoFactoryRunToken == runToken
+        and sg.Parent do
+        task.wait(0.5)
+        if not globalEnv.AutoFactory
+            or globalEnv.AutoFactoryRunToken ~= runToken
+            or not sg.Parent then
+            break
+        end
+
+        if not CFG.AutoStore then
+            lblStore.Text = "📦 Auto Store: Đã tắt"
+            continue
+        end
+
+        local core = FindCore()
+        if core and IsMobAlive(core) then
+            lblStore.Text = "📦 Storage: Tạm dừng khi đánh Core"
+            continue
+        end
+
+        local count, deferred = CountFruitInBackpack()
+        if count <= 0 then
+            if deferred > 0 then
+                lblStore.Text = string.format("⏳ Chờ retry %d Fruit", deferred)
+            else
+                lblStore.Text = "📦 Storage: Sẵn sàng"
+            end
+            continue
+        end
+
+        local stored, attempted, skipped, storeError = StoreFruitInBackpack()
+        if storeError == "cooldown" or storeError == "busy" then
+            lblStore.Text = string.format("📦 Chờ lưu: %d Fruit", count)
+        elseif stored > 0 and skipped > 0 then
+            lblStore.Text = string.format("✅ Lưu %d | ⏳ Retry %d", stored, skipped)
+        elseif skipped > 0 then
+            lblStore.Text = string.format("⏳ Chờ retry %d Fruit", skipped)
+        elseif attempted > 0 and stored == attempted then
+            lblStore.Text = string.format("✅ Đã lưu %d Fruit", stored)
+        elseif attempted > 0 then
+            lblStore.Text = string.format("⚠️ Đã lưu %d/%d Fruit", stored, attempted)
+        else
+            lblStore.Text = "⚠️ " .. tostring(storeError or "Không lưu được Fruit")
+        end
+    end
 end)
 
 -- Remote Random Fruit chạy riêng để InvokeServer không làm chậm vòng ưu tiên Core.
@@ -1137,6 +1309,11 @@ task.spawn(function()
         and globalEnv.AutoFactoryRunToken == runToken
         and sg.Parent do
         task.wait(math.max(tonumber(CFG.RandomFruitInterval) or 0.5, 0.2))
+        if not globalEnv.AutoFactory
+            or globalEnv.AutoFactoryRunToken ~= runToken
+            or not sg.Parent then
+            break
+        end
 
         if CFG.AutoRandomFruit then
             local callOk, bought, status, detail = pcall(RandomFruit)
@@ -1165,7 +1342,7 @@ end)
 -- MAIN LOOP
 -- ─────────────────────────────────────────────
 print(string.format(
-    "[AutoFactory] Đã bắt đầu! Core Melee-only; tốc độ di chuyển %d; Auto Random Fruit.",
+    "[AutoFactory] Đã bắt đầu! Core Melee-only; tốc độ di chuyển %d; Auto Buso; Auto Random Fruit.",
     math.max(tonumber(CFG.MoveSpeed) or 300, 1)
 ))
 
@@ -1178,6 +1355,11 @@ task.spawn(function()
             and globalEnv.AutoFactoryRunToken == runToken
             and sg.Parent do
             task.wait(CFG.LoopDelay)
+            if not globalEnv.AutoFactory
+                or globalEnv.AutoFactoryRunToken ~= runToken
+                or not sg.Parent then
+                break
+            end
 
         local char = GetChar()
         local humanoid = GetHumanoid()
@@ -1257,7 +1439,8 @@ task.spawn(function()
         end
 
         -- ══════════════════════════════════════
-        -- PHẦN 2: LƯU + TÌM FRUIT (chỉ khi không có Core)
+        -- PHẦN 2: TÌM FRUIT (chỉ khi không có Core)
+        -- Auto Store chạy ở task riêng để không giữ vòng quét Core.
         -- ══════════════════════════════════════
         if moveState.purpose == "Core" or moveState.purpose == "CoreHold" then
             CancelMove(true)
@@ -1266,33 +1449,6 @@ task.spawn(function()
         local dots = string.rep(".", (waitTick % 3) + 1)
         lblMode.Text = "🔍 Tìm Core" .. dots
         lblBoss.Text = "💀 Boss: Chờ spawn..."
-
-        -- Thử lưu cả Fruit còn sót trong Backpack từ lần trước.
-        if CFG.AutoStore then
-            local count, ignored = CountFruitInBackpack()
-            if count > 0 then
-                local stored, attempted, skipped, storeError = StoreFruitInBackpack()
-                if storeError == "cooldown" or storeError == "busy" then
-                    lblStore.Text = string.format("📦 Chờ lưu: %d fruit(s)", count)
-                elseif skipped > 0 and stored > 0 then
-                    lblStore.Text = string.format("✅ Lưu %d | ⏭️ Bỏ qua %d", stored, skipped)
-                elseif skipped > 0 then
-                    lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit đã bị từ chối", skipped)
-                elseif attempted > 0 and stored == attempted then
-                    lblStore.Text = string.format("✅ Đã lưu %d fruit(s)", stored)
-                elseif attempted > 0 then
-                    lblStore.Text = string.format("⚠️ Đã lưu %d/%d fruit(s)", stored, attempted)
-                else
-                    lblStore.Text = "⚠️ " .. tostring(storeError or "Không lưu được Fruit")
-                end
-            elseif ignored > 0 then
-                lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit đã bị từ chối", ignored)
-            else
-                lblStore.Text = "📦 Storage: Sẵn sàng"
-            end
-        else
-            lblStore.Text = "📦 Auto Store: Đã tắt"
-        end
 
         if CFG.FruitEnabled then
             local fruit, fruitDist = FindFruitInWorld()
@@ -1331,11 +1487,18 @@ task.spawn(function()
             lblFruit.Text = "🍎 Auto Fruit: Đã tắt"
         end
 
-            task.wait(0.8)
+        task.wait(0.8)
         end
     end, function(err)
         return tostring(err)
     end)
+
+    -- Nếu đây vẫn là run hiện tại, dừng tất cả task nền kể cả khi main bị lỗi
+    -- hoặc GUI bị xóa. Cleanup của run cũ không được tắt một run mới.
+    if globalEnv.AutoFactoryRunToken == runToken then
+        globalEnv.AutoFactory = false
+        globalEnv.AutoFactoryBusoEnabled = false
+    end
 
     CancelMove(true)
     if globalEnv.AutoFactoryMoveCleanup == moveCleanup then
