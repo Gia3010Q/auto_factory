@@ -46,7 +46,10 @@ local CFG = {
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     RemoteAttackDelay = 0.12,
     MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
-    CoreSnapDistance  = 150,  -- toTarget(cf): snap khi đã gần
+    TravelForce       = 1e5,  -- Lực float nhẹ khi đang bay, giữ chuyển động mượt
+    CoreHoldForce     = 9e9,  -- Cùng mức FlyGuiV3 để Core không hất nhân vật ra
+    CoreSnapDistance  = 4,    -- Chỉ snap đoạn cuối rất ngắn, tránh giật từ xa
+    CoreHoldTolerance = 6,    -- Core đẩy lệch quá mức này thì khóa trả về điểm đánh
     FruitSnapDistance = 8,    -- toTarget(cf, true): ngưỡng gốc
 
     -- Fruit
@@ -433,9 +436,20 @@ local function MarkTeleporting()
     end)
 end
 
-local function EnsureMoveFloat(hrp)
+local function EnsureMoveFloat(hrp, maxForce)
     if not hrp then return end
-    if moveState.floatForce and moveState.floatForce.Parent == hrp then return end
+    local forceValue = math.max(
+        tonumber(maxForce) or tonumber(CFG.TravelForce) or 1e5,
+        0
+    )
+    if moveState.floatForce and moveState.floatForce.Parent == hrp then
+        moveState.floatForce.MaxForce = Vector3.new(
+            forceValue,
+            forceValue,
+            forceValue
+        )
+        return
+    end
     if moveState.floatForce then
         pcall(function() moveState.floatForce:Destroy() end)
         moveState.floatForce = nil
@@ -448,18 +462,20 @@ local function EnsureMoveFloat(hrp)
     local force = Instance.new("BodyVelocity")
     force.Name = "AutoFactoryFloatForce"
     force.Velocity = Vector3.zero
-    force.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    force.MaxForce = Vector3.new(forceValue, forceValue, forceValue)
     force.P = 1e4
     force.Parent = hrp
     moveState.floatForce = force
 end
 
-local function RestoreMoveCharacter()
-    globalEnv.noclip = false
+local function RestoreMoveCharacter(keepFloatForce, keepNoclip)
+    globalEnv.noclip = keepNoclip == true
 
     local force = moveState.floatForce
-    moveState.floatForce = nil
-    if force then pcall(function() force:Destroy() end) end
+    if not keepFloatForce then
+        moveState.floatForce = nil
+        if force then pcall(function() force:Destroy() end) end
+    end
 
     local hrp = GetHRP()
     if hrp then
@@ -478,12 +494,14 @@ local function RestoreMoveCharacter()
         moveState.addedTeleportTag = false
     end
 
-    for part, oldCanCollide in pairs(moveState.collisionState) do
-        if part and part.Parent then
-            pcall(function() part.CanCollide = oldCanCollide end)
+    if not keepNoclip then
+        for part, oldCanCollide in pairs(moveState.collisionState) do
+            if part and part.Parent then
+                pcall(function() part.CanCollide = oldCanCollide end)
+            end
         end
+        table.clear(moveState.collisionState)
     end
-    table.clear(moveState.collisionState)
 end
 
 local function CancelMove(restoreCharacter)
@@ -495,9 +513,13 @@ local function CancelMove(restoreCharacter)
     if restoreCharacter then RestoreMoveCharacter() end
 end
 
--- Giữ nhân vật ổn định khi đã vào tầm Core mà không snap CFrame mỗi frame.
--- BodyVelocity chỉ triệt vận tốc/rơi tự do; vị trí vẫn được server quản lý.
-local function BeginCoreHold()
+-- Giữ nhân vật ổn định khi đã vào tầm Core. BodyVelocity triệt vận tốc/rơi;
+-- Heartbeat chỉ khóa trả về mục tiêu khi hitbox của Core đẩy lệch quá tolerance.
+local function BeginCoreHold(targetCF)
+    if typeof(targetCF) ~= "CFrame" then
+        return false, "Điểm giữ Core không hợp lệ"
+    end
+
     local hrp = GetHRP()
     local humanoid = GetHumanoid()
     if not hrp or not humanoid or humanoid.Health <= 0 then
@@ -507,12 +529,27 @@ local function BeginCoreHold()
     if moveState.purpose ~= "CoreHold"
         or not moveState.floatForce
         or moveState.floatForce.Parent ~= hrp then
-        CancelMove(true)
-        EnsureMoveFloat(hrp)
+        local canReuseFloat = moveState.floatForce
+            and moveState.floatForce.Parent == hrp
+        CancelMove(false)
+        moveState.purpose = "CoreHold"
+        -- Chuyển từ lực bay nhẹ sang lực giữ Core; trạng thái humanoid được
+        -- ghi lại bên dưới để khi Core chết có thể khôi phục đúng như trước.
+        RestoreMoveCharacter(canReuseFloat, true)
+        EnsureMoveFloat(hrp, CFG.CoreHoldForce)
         moveState.purpose = "CoreHold"
     end
 
-    globalEnv.noclip = false
+    -- Khác với giữ vận tốc bằng 0, phải nhớ chính xác điểm đánh để Heartbeat
+    -- kéo trả ngay khi lực/hitbox của Core hất nhân vật ra ngoài.
+    moveState.target = targetCF
+    globalEnv.noclip = true
+    if moveState.previousPlatformStand == nil then
+        moveState.previousPlatformStand = humanoid.PlatformStand
+        moveState.platformHumanoid = humanoid
+    end
+    humanoid.PlatformStand = true
+    EnsureMoveFloat(hrp, CFG.CoreHoldForce)
     moveState.floatForce.Velocity = Vector3.zero
     StopRootVelocity(hrp)
     return true
@@ -558,6 +595,7 @@ local function ToTarget(cf, shortSnap, purpose)
     local snapDistance = shortSnap and CFG.FruitSnapDistance or CFG.CoreSnapDistance
 
     if distance <= snapDistance then
+        local arrivedAtCore = purpose == "Core"
         CancelMove(false)
         local ok, err = pcall(function()
             MarkTeleporting()
@@ -569,7 +607,14 @@ local function ToTarget(cf, shortSnap, purpose)
             RestoreMoveCharacter()
             return false, "Snap CFrame lỗi: " .. tostring(err)
         end
-        RestoreMoveCharacter()
+        if arrivedAtCore then
+            EnsureMoveFloat(hrp, CFG.CoreHoldForce)
+            moveState.purpose = "CoreHold"
+            moveState.target = cf
+            RestoreMoveCharacter(true, true)
+        else
+            RestoreMoveCharacter()
+        end
         return true, "Snap"
     end
 
@@ -586,7 +631,7 @@ local function ToTarget(cf, shortSnap, purpose)
 
     CancelMove(false)
     globalEnv.noclip = true
-    EnsureMoveFloat(hrp)
+    EnsureMoveFloat(hrp, CFG.TravelForce)
     if moveState.previousPlatformStand == nil then
         moveState.previousPlatformStand = humanoid.PlatformStand
         moveState.platformHumanoid = humanoid
@@ -603,7 +648,8 @@ local function ToTarget(cf, shortSnap, purpose)
 end
 
 TrackConnection(RunService.Heartbeat, function(dt)
-    if not moveState.active then return end
+    local holdingCore = moveState.purpose == "CoreHold"
+    if not moveState.active and not holdingCore then return end
     if not globalEnv.AutoFactory or globalEnv.AutoFactoryRunToken ~= runToken then
         CancelMove(true)
         return
@@ -617,15 +663,51 @@ TrackConnection(RunService.Heartbeat, function(dt)
         return
     end
 
+    if holdingCore then
+        local holdTolerance = math.max(
+            tonumber(CFG.CoreHoldTolerance) or 6,
+            1
+        )
+        local drift = (hrp.Position - targetCF.Position).Magnitude
+
+        globalEnv.noclip = true
+        if moveState.previousPlatformStand == nil then
+            moveState.previousPlatformStand = humanoid.PlatformStand
+            moveState.platformHumanoid = humanoid
+        end
+        humanoid.PlatformStand = true
+        EnsureMoveFloat(hrp, CFG.CoreHoldForce)
+        moveState.floatForce.Velocity = Vector3.zero
+
+        -- Core có lực/hitbox đẩy người chơi ra. CoreHold cũ chỉ triệt velocity
+        -- tại vị trí đã bị đẩy nên nhân vật vẫn bay xa. Chỉ snap lại khi lệch
+        -- quá tolerance để giữ chắc mà không ghi CFrame liên tục lúc đang yên.
+        if drift > holdTolerance then
+            MarkTeleporting()
+            hrp.CFrame = targetCF
+        end
+        StopRootVelocity(hrp)
+        return
+    end
+
     local currentPos = hrp.Position
     local targetPos = targetCF.Position
     local offset = targetPos - currentPos
     local remaining = offset.Magnitude
 
     if remaining <= moveState.snapDistance then
+        local arrivedAtCore = moveState.purpose == "Core"
         hrp.CFrame = targetCF
         StopRootVelocity(hrp)
-        CancelMove(true)
+        CancelMove(false)
+        if arrivedAtCore then
+            EnsureMoveFloat(hrp, CFG.CoreHoldForce)
+            moveState.purpose = "CoreHold"
+            moveState.target = targetCF
+            RestoreMoveCharacter(true, true)
+        else
+            RestoreMoveCharacter()
+        end
         return
     end
 
@@ -637,13 +719,13 @@ TrackConnection(RunService.Heartbeat, function(dt)
 
     globalEnv.noclip = true
     humanoid.PlatformStand = true
-    EnsureMoveFloat(hrp)
+    EnsureMoveFloat(hrp, CFG.TravelForce)
     hrp.CFrame = CFrame.new(newPos) * targetRotation
     StopRootVelocity(hrp)
 end)
 
 TrackConnection(RunService.Stepped, function()
-    if not moveState.active then return end
+    if not moveState.active and moveState.purpose ~= "CoreHold" then return end
     local char = GetChar()
     if not char then return end
 
@@ -1441,9 +1523,27 @@ task.spawn(function()
                 hp, maxHp, pct, dist
             )
 
-            if exactDist > CFG.AttackRange then
+            -- Luôn bám cùng một điểm ổn định phía trên Core. Không dùng rotation
+            -- của boss vì boss quay mặt có thể làm HRP của người chơi rung theo.
+            local coreOffsetY = tonumber(CFG.CoreOffsetY) or 20
+            local coreTargetPosition = bossHRP.Position + Vector3.new(0, coreOffsetY, 0)
+            local coreTargetRotation = hrp.CFrame.Rotation
+            if moveState.purpose == "Core" and moveState.target then
+                coreTargetRotation = moveState.target.Rotation
+            end
+            local coreTargetCF = CFrame.new(coreTargetPosition) * coreTargetRotation
+            local targetDistance = (hrp.Position - coreTargetPosition).Magnitude
+            local coreSnapDistance = math.max(tonumber(CFG.CoreSnapDistance) or 4, 1)
+            local holdTolerance = math.max(
+                tonumber(CFG.CoreHoldTolerance) or 6,
+                coreSnapDistance
+            )
+            local repositionDistance = moveState.purpose == "CoreHold"
+                and holdTolerance or coreSnapDistance
+
+            if targetDistance > repositionDistance then
                 local moved, moveStatus = ToTarget(
-                    bossHRP.CFrame * CFrame.new(0, CFG.CoreOffsetY, 0),
+                    coreTargetCF,
                     false,
                     "Core"
                 )
@@ -1456,10 +1556,9 @@ task.spawn(function()
                 continue
             end
 
-            -- Đã vào tầm đánh: ngừng Heartbeat CFrame movement và chỉ triệt vận
-            -- tốc bằng CoreHold. Nhờ vậy nhân vật không bị snap hoặc rơi rồi bay
-            -- lên lặp lại trong lúc đánh.
-            local holding, holdError = BeginCoreHold()
+            -- Đã vào tầm đánh: CoreHold triệt vận tốc và chỉ khóa trả về điểm
+            -- đánh khi hitbox Core đẩy lệch quá tolerance.
+            local holding, holdError = BeginCoreHold(coreTargetCF)
             if not holding then
                 lblMode.Text = "⚠️ " .. tostring(holdError or "Không thể giữ vị trí đánh")
                 continue
