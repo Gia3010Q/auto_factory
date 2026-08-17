@@ -41,7 +41,8 @@ local CFG = {
     -- Factory
     CoreOffsetY   = 20,     -- Offset gốc của Auto Factory
     FactorySafePosition = Vector3.new(415.930, 199.602, -409.127), -- Điểm an toàn trên nóc Factory
-    AttackRange   = 30,     -- AttackFunction gốc dùng range 30
+    AttackRange   = 30,     -- Tầm fallback M1 bằng input
+    RemoteAttackRange = 80, -- Điểm an toàn cố định cần đánh remote từ xa hơn
     LoopDelay     = 0.05,   -- Delay vòng lặp (giây)
     M1HoldTime    = 0.05,   -- Thời gian giữ chuột cho mỗi đòn Melee
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
@@ -864,16 +865,13 @@ local function AttackCore(core)
     local coreRoot = core:FindFirstChild("HumanoidRootPart")
     if not coreRoot then return nil, "Core thiếu HumanoidRootPart" end
 
-    -- Kiểm tra tầm
-    if DistTo(coreRoot.Position) > CFG.AttackRange then
-        return nil, "Core ngoài tầm M1"
-    end
-
     local melee, equipError = EquipMelee()
     if not melee then
         Log(equipError)
         return nil, equipError
     end
+
+    local coreDistance = DistTo(coreRoot.Position)
 
     -- AttackFunction gốc không đánh khi Character.Stun.Value ~= 0.
     local stun = char:FindFirstChild("Stun")
@@ -881,10 +879,27 @@ local function AttackCore(core)
         return nil, "Đang bị Stun"
     end
 
-    local remoteOk, attackMode = TrySourceMeleeAttack(core)
-    if remoteOk then
-        Log("Melee M1 via source combat remotes: " .. melee.Name)
-        return melee.Name, nil, attackMode
+    local remoteRange = math.max(
+        tonumber(CFG.RemoteAttackRange) or 80,
+        tonumber(CFG.AttackRange) or 30
+    )
+    local remoteOk, attackMode = false, "Core ngoài tầm remote"
+    if coreDistance <= remoteRange then
+        remoteOk, attackMode = TrySourceMeleeAttack(core)
+        if remoteOk then
+            Log("Melee M1 via source combat remotes: " .. melee.Name)
+            return melee.Name, nil, attackMode
+        end
+    end
+
+    -- Input M1 vẫn cần đứng gần. Chốt này đặt sau remote/equip để điểm an toàn
+    -- cố định không chặn hoàn toàn việc chuyển sang Melee như trước.
+    local inputRange = math.max(tonumber(CFG.AttackRange) or 30, 1)
+    if coreDistance > inputRange then
+        return nil, string.format(
+            "Remote lỗi và Core ngoài tầm M1 (%.0fm)",
+            coreDistance
+        )
     end
 
     -- Fallback khi game cập nhật/đổi module Net hoặc executor không require được module.
