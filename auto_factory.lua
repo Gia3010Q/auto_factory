@@ -782,6 +782,7 @@ end
 -- Source gốc dùng: CommF_:InvokeServer("StoreFruit", originalName, tool)
 -- ─────────────────────────────────────────────
 local lastStoreTime = 0
+local storeInProgress = false
 
 local function IsInPlayerInventory(item)
     if not item or not item.Parent then return false end
@@ -815,9 +816,15 @@ local function MarkFruitStoreIgnored(item)
     end
 end
 
-local function StoreFruitInBackpack()
+local function StoreFruitInBackpack(bypassCooldown)
+    -- Vòng main và vòng Remote Random có thể cùng yêu cầu lưu. Không cho hai
+    -- lượt quét chạy chồng nhau vì chúng có thể gửi StoreFruit hai lần cho cùng Tool.
+    if storeInProgress then
+        return 0, 0, 0, "busy"
+    end
+
     -- Cooldown để không spam
-    if (tick() - lastStoreTime) < CFG.StoreCooldown then
+    if not bypassCooldown and (tick() - lastStoreTime) < CFG.StoreCooldown then
         return 0, 0, 0, "cooldown"
     end
 
@@ -834,6 +841,7 @@ local function StoreFruitInBackpack()
     local stored = 0
     local attempted = 0
     local skipped = 0
+    storeInProgress = true
     lastStoreTime = tick()
 
     local function storeFrom(container)
@@ -886,8 +894,18 @@ local function StoreFruitInBackpack()
         end
     end
 
-    storeFrom(bp)
-    if char then storeFrom(char) end
+    local runOk, runError = xpcall(function()
+        storeFrom(bp)
+        if char then storeFrom(char) end
+    end, function(err)
+        return tostring(err)
+    end)
+    storeInProgress = false
+
+    if not runOk then
+        Log("StoreFruit loop lỗi: " .. tostring(runError))
+        return stored, attempted, skipped, runError
+    end
 
     Log(string.format("Stored %d/%d fruit(s), skipped %d", stored, attempted, skipped))
     return stored, attempted, skipped
@@ -933,39 +951,6 @@ local function GetActiveRandomFruitBoxName()
     return "DLCBoxData"
 end
 
--- remote_random_fruit.lua tự cất Fruit ngay sau khi quay thành công. Hàm này
--- cố ý không dùng cooldown/ignored list của vòng Auto Store để Fruit mới nhận
--- được gửi vào Storage ngay cả khi main loop vừa thử lưu trước đó.
-local function StoreRemoteRandomFruits()
-    local commF = GetCommF()
-    if not commF then return 0, "Không tìm thấy CommF_" end
-
-    local stored = 0
-    local function processContainer(container)
-        if not container then return end
-        for _, tool in ipairs(container:GetChildren()) do
-            if tool:IsA("Tool") and string.find(tool.Name, "Fruit", 1, true) then
-                local shortName = string.gsub(tool.Name, " Fruit", "")
-                local originalName = tool:GetAttribute("OriginalName")
-                    or (shortName .. "-" .. shortName)
-                local ok, result = pcall(function()
-                    return commF:InvokeServer("StoreFruit", originalName, tool)
-                end)
-                if ok then
-                    stored = stored + 1
-                    Log("Remote Random StoreFruit: " .. tool.Name)
-                else
-                    Log("Remote Random StoreFruit lỗi: " .. tostring(result))
-                end
-            end
-        end
-    end
-
-    processContainer(lp:FindFirstChild("Backpack"))
-    processContainer(GetChar())
-    return stored
-end
-
 local function RandomFruit()
     local commF = GetCommF()
     if not commF then return false, "RemoteError", "Không tìm thấy CommF_" end
@@ -1006,7 +991,9 @@ local function RandomFruit()
     if result and result ~= false then
         Log("Remote Random Fruit thành công: " .. tostring(result))
         task.wait(1)
-        StoreRemoteRandomFruits()
+        -- Lưu ngay nhưng vẫn dùng chung cơ chế đánh dấu Ignored. Một Tool bị
+        -- server từ chối vì kho đầy sẽ không bao giờ bị gửi StoreFruit lặp lại.
+        StoreFruitInBackpack(true)
         return true, "Bought", boxName
     end
 
@@ -1285,7 +1272,7 @@ task.spawn(function()
             local count, ignored = CountFruitInBackpack()
             if count > 0 then
                 local stored, attempted, skipped, storeError = StoreFruitInBackpack()
-                if storeError == "cooldown" then
+                if storeError == "cooldown" or storeError == "busy" then
                     lblStore.Text = string.format("📦 Chờ lưu: %d fruit(s)", count)
                 elseif skipped > 0 and stored > 0 then
                     lblStore.Text = string.format("✅ Lưu %d | ⏭️ Bỏ qua %d", stored, skipped)
