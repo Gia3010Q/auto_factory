@@ -43,10 +43,11 @@ local CFG = {
     FactorySafePosition = Vector3.new(415.930, 199.602, -409.127), -- Điểm an toàn trên nóc Factory
     AttackRange   = 30,     -- Tầm fallback M1 bằng input
     RemoteAttackRange = 80, -- Điểm an toàn cố định cần đánh remote từ xa hơn
-    LoopDelay     = 0.05,   -- Delay vòng lặp (giây)
+    LoopDelay     = 0,      -- task.wait() mỗi frame, giống Auto Factory gốc
     M1HoldTime    = 0.05,   -- Thời gian giữ chuột cho mỗi đòn Melee
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
-    RemoteAttackDelay = 0.12,
+    AttackNoAnimation = true, -- RegisterAttack(0) + RegisterHit, không chạy animation
+    RemoteAttackDelay = 0,    -- Bản gốc không có client cooldown
     MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     TravelForce       = 1e5,  -- Lực float nhẹ khi đang bay, giữ chuyển động mượt
     CoreHoldForce     = 9e9,  -- Cùng mức FlyGuiV3 để Core không hất nhân vật ra
@@ -377,9 +378,11 @@ end
 
 local function TrySourceMeleeAttack(core)
     if not CFG.UseCombatRemotes then return false, "Combat remotes đã tắt" end
+    if not CFG.AttackNoAnimation then return false, "Attack No Animation đã tắt" end
 
     local now = tick()
-    if (now - lastRemoteAttack) < CFG.RemoteAttackDelay then
+    local attackDelay = math.max(tonumber(CFG.RemoteAttackDelay) or 0, 0)
+    if attackDelay > 0 and (now - lastRemoteAttack) < attackDelay then
         return true, "Remote"
     end
 
@@ -392,8 +395,12 @@ local function TrySourceMeleeAttack(core)
     if not hitPart then return false, "Core thiếu hit part" end
 
     local ok, err = pcall(function()
+        -- AttackFunction gốc khi Attack No Animation bật:
+        -- RegisterAttack(0), lấy hit chính ra khỏi danh sách AOE rồi gửi phần
+        -- hit phụ còn lại. Core là mục tiêu duy nhất nên danh sách phụ rỗng.
+        local secondaryHitParts = {}
         attackRemote:FireServer(0)
-        hitRemote:FireServer(hitPart, { hitPart })
+        hitRemote:FireServer(hitPart, secondaryHitParts)
     end)
     if not ok then
         registerAttackRemote = nil
