@@ -865,6 +865,27 @@ end
 -- Đếm số fruit đang trong Backpack + Character
 -- ─────────────────────────────────────────────
 local storeRetryAt = setmetatable({}, { __mode = "k" })
+local storeRejectedItems = setmetatable({}, { __mode = "k" })
+local STORE_REJECTED_ATTRIBUTE = "AutoFactoryStoreRejected"
+
+local function IsStoreRejected(item)
+    if not item then return false end
+    if storeRejectedItems[item] then return true end
+
+    local ok, rejected = pcall(function()
+        return item:GetAttribute(STORE_REJECTED_ATTRIBUTE) == true
+    end)
+    return ok and rejected
+end
+
+local function RejectFruitStore(item)
+    if not item then return end
+    storeRejectedItems[item] = true
+    storeRetryAt[item] = nil
+    pcall(function()
+        item:SetAttribute(STORE_REJECTED_ATTRIBUTE, true)
+    end)
+end
 
 local function IsStoreDeferred(item)
     return item ~= nil and (storeRetryAt[item] or 0) > tick()
@@ -876,7 +897,7 @@ local function DeferFruitStore(item)
 end
 
 local function CountFruitInBackpack()
-    local count, deferred = 0, 0
+    local count, deferred, rejected = 0, 0, 0
     local char  = GetChar()
     local bp    = lp:FindFirstChild("Backpack")
 
@@ -885,7 +906,9 @@ local function CountFruitInBackpack()
         for _, item in ipairs(container:GetChildren()) do
             local ok, isFruit = pcall(IsFruitTool, item)
             if ok and isFruit then
-                if IsStoreDeferred(item) then
+                if IsStoreRejected(item) then
+                    rejected = rejected + 1
+                elseif IsStoreDeferred(item) then
                     deferred = deferred + 1
                 else
                     count = count + 1
@@ -896,7 +919,7 @@ local function CountFruitInBackpack()
 
     checkContainer(bp)
     if char then checkContainer(char) end
-    return count, deferred
+    return count, deferred, rejected
 end
 
 -- ─────────────────────────────────────────────
@@ -927,13 +950,13 @@ end
 local function StoreFruitInBackpack(bypassCooldown)
     -- Chặn các lượt quét chồng nhau để không gửi StoreFruit hai lần cho cùng Tool.
     if storeInProgress then
-        return 0, 0, 0, "busy"
+        return 0, 0, 0, "busy", 0
     end
 
     -- Cooldown để không spam
     local cooldown = math.max(tonumber(CFG.StoreCooldown) or 3, 0)
     if not bypassCooldown and (tick() - lastStoreTime) < cooldown then
-        return 0, 0, 0, "cooldown"
+        return 0, 0, 0, "cooldown", 0
     end
 
     local char = GetChar()
@@ -943,12 +966,13 @@ local function StoreFruitInBackpack(bypassCooldown)
     if commF then commF = commF:FindFirstChild("CommF_") end
     if not commF then
         Log("StoreFruit: CommF_ not found!")
-        return 0, 0, 0, "Không tìm thấy CommF_"
+        return 0, 0, 0, "Không tìm thấy CommF_", 0
     end
 
     local stored = 0
     local attempted = 0
-    local skipped = 0
+    local deferred = 0
+    local rejected = 0
     storeInProgress = true
     lastStoreTime = tick()
 
@@ -965,10 +989,12 @@ local function StoreFruitInBackpack(bypassCooldown)
                     continue
                 end
 
-                -- Fruit bị từ chối/lỗi chỉ được hoãn có thời hạn, không gắn
-                -- IntValue Ignored vĩnh viễn lên Tool.
-                if IsStoreDeferred(item) then
-                    skipped = skipped + 1
+                if IsStoreRejected(item) then
+                    rejected = rejected + 1
+                    Log("Skip StoreFruit (server đã từ chối): " .. itemName)
+                    continue
+                elseif IsStoreDeferred(item) then
+                    deferred = deferred + 1
                     Log("Defer StoreFruit (đang chờ retry): " .. itemName)
                     continue
                 end
@@ -988,15 +1014,16 @@ local function StoreFruitInBackpack(bypassCooldown)
                     stored = stored + 1
                     Log("Stored: " .. itemName)
                 elseif ok then
-                    -- InvokeServer không ném lỗi nhưng Tool vẫn còn: có thể kho
-                    -- đầy, server chậm hoặc từ chối tạm thời. Hoãn rồi thử lại.
-                    DeferFruitStore(item)
-                    skipped = skipped + 1
-                    Log("StoreFruit rejected, retry later: "
+                    -- Remote đã xử lý nhưng Tool vẫn còn: kho đầy/đủ giới hạn
+                    -- hoặc server từ chối. Ghi nhớ để không spam lại Fruit này.
+                    RejectFruitStore(item)
+                    rejected = rejected + 1
+                    Log("StoreFruit rejected, skip permanently: "
                         .. itemName .. " | " .. tostring(result))
                 else
+                    -- Lỗi gọi remote có thể chỉ là lỗi executor/mạng tạm thời.
                     DeferFruitStore(item)
-                    skipped = skipped + 1
+                    deferred = deferred + 1
                     Log("StoreFruit failed: " .. itemName .. " | " .. tostring(result))
                 end
             end
@@ -1013,11 +1040,14 @@ local function StoreFruitInBackpack(bypassCooldown)
 
     if not runOk then
         Log("StoreFruit loop lỗi: " .. tostring(runError))
-        return stored, attempted, skipped, runError
+        return stored, attempted, deferred, runError, rejected
     end
 
-    Log(string.format("Stored %d/%d fruit(s), skipped %d", stored, attempted, skipped))
-    return stored, attempted, skipped
+    Log(string.format(
+        "Stored %d/%d fruit(s), deferred %d, rejected %d",
+        stored, attempted, deferred, rejected
+    ))
+    return stored, attempted, deferred, nil, rejected
 end
 
 -- ─────────────────────────────────────────────
@@ -1276,23 +1306,33 @@ task.spawn(function()
             continue
         end
 
-        local count, deferred = CountFruitInBackpack()
+        local count, deferred, rejected = CountFruitInBackpack()
         if count <= 0 then
-            if deferred > 0 then
+            if deferred > 0 and rejected > 0 then
+                lblStore.Text = string.format(
+                    "⏳ Retry %d | ⏭️ Bỏ qua %d", deferred, rejected
+                )
+            elseif deferred > 0 then
                 lblStore.Text = string.format("⏳ Chờ retry %d Fruit", deferred)
+            elseif rejected > 0 then
+                lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit không thể lưu", rejected)
             else
                 lblStore.Text = "📦 Storage: Sẵn sàng"
             end
             continue
         end
 
-        local stored, attempted, skipped, storeError = StoreFruitInBackpack()
+        local stored, attempted, retrying, storeError, rejectedNow = StoreFruitInBackpack()
         if storeError == "cooldown" or storeError == "busy" then
             lblStore.Text = string.format("📦 Chờ lưu: %d Fruit", count)
-        elseif stored > 0 and skipped > 0 then
-            lblStore.Text = string.format("✅ Lưu %d | ⏳ Retry %d", stored, skipped)
-        elseif skipped > 0 then
-            lblStore.Text = string.format("⏳ Chờ retry %d Fruit", skipped)
+        elseif stored > 0 and rejectedNow > 0 then
+            lblStore.Text = string.format("✅ Lưu %d | ⏭️ Bỏ qua %d", stored, rejectedNow)
+        elseif rejectedNow > 0 then
+            lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit không thể lưu", rejectedNow)
+        elseif stored > 0 and retrying > 0 then
+            lblStore.Text = string.format("✅ Lưu %d | ⏳ Retry %d", stored, retrying)
+        elseif retrying > 0 then
+            lblStore.Text = string.format("⏳ Chờ retry %d Fruit", retrying)
         elseif attempted > 0 and stored == attempted then
             lblStore.Text = string.format("✅ Đã lưu %d Fruit", stored)
         elseif attempted > 0 then
