@@ -40,6 +40,7 @@ local lp = Players.LocalPlayer
 local CFG = {
     -- Factory
     CoreOffsetY   = 20,     -- Offset gốc của Auto Factory
+    FactorySafePosition = Vector3.new(415.930, 199.602, -409.127), -- Điểm an toàn trên nóc Factory
     AttackRange   = 30,     -- AttackFunction gốc dùng range 30
     LoopDelay     = 0.05,   -- Delay vòng lặp (giây)
     M1HoldTime    = 0.05,   -- Thời gian giữ chuột cho mỗi đòn Melee
@@ -1523,10 +1524,19 @@ task.spawn(function()
                 hp, maxHp, pct, dist
             )
 
-            -- Luôn bám cùng một điểm ổn định phía trên Core. Không dùng rotation
-            -- của boss vì boss quay mặt có thể làm HRP của người chơi rung theo.
+            -- Ưu tiên điểm vừa lưu trong phiên; nếu không có thì dùng điểm an
+            -- toàn đã hard-code. Core + 20Y chỉ còn là fallback cuối.
             local coreOffsetY = tonumber(CFG.CoreOffsetY) or 20
-            local coreTargetPosition = bossHRP.Position + Vector3.new(0, coreOffsetY, 0)
+            local savedSafePosition = globalEnv.FactorySafePosition
+            local configuredSafePosition = CFG.FactorySafePosition
+            local coreTargetPosition
+            if typeof(savedSafePosition) == "Vector3" then
+                coreTargetPosition = savedSafePosition
+            elseif typeof(configuredSafePosition) == "Vector3" then
+                coreTargetPosition = configuredSafePosition
+            else
+                coreTargetPosition = bossHRP.Position + Vector3.new(0, coreOffsetY, 0)
+            end
             local coreTargetRotation = hrp.CFrame.Rotation
             if moveState.purpose == "Core" and moveState.target then
                 coreTargetRotation = moveState.target.Rotation
