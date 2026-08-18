@@ -75,7 +75,7 @@ local CFG = {
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     AttackNoAnimation = true, -- RegisterAttack(0) + RegisterHit, không chạy animation
     RemoteAttackDelay = 0,    -- Bản gốc không có client cooldown
-    MoveSpeed         = 280,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
+    MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     TravelForce       = 1e5,  -- Lực float nhẹ khi đang bay, giữ chuyển động mượt
     CoreHoldForce     = 9e9,  -- Cùng mức FlyGuiV3 để Core không hất nhân vật ra
     CoreSnapDistance  = 4,    -- Chỉ snap đoạn cuối rất ngắn, tránh giật từ xa
@@ -103,6 +103,7 @@ local CFG = {
     WebhookURL        = "",    -- Dán link Webhook Discord vào đây (hoặc getgenv().WebhookURL = "...")
     WebhookPing       = "@everyone", -- "@everyone", "" (không ping) hoặc "<@ID_CỦA_BẠN>"
     WebhookOnPickup   = true,  -- Gửi webhook khi nhặt được trái trên map
+    WebhookOnRandom   = true,  -- Gửi webhook ngay khi Remote Random thành công
     WebhookOnStore    = true,  -- Gửi webhook khi cất trái vào Storage thành công
     WebhookUsername   = "Noti Fruit",
     WebhookAvatarURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539261907322540132/ChatGPT_Image_20_16_58_18_thg_8_2026.png?ex=6a85acdc&is=6a845b5c&hm=5e89b948085f846878ad8da74600c4bc33b2bf6f13c95ec0aa69fa1bcfbb7e2b",
@@ -211,6 +212,7 @@ local function SendFruitWebhook(eventType, fruitName)
     end
 
     if eventType == "Picked" and not CFG.WebhookOnPickup then return end
+    if eventType == "Random" and not CFG.WebhookOnRandom then return end
     if eventType == "Stored" and not CFG.WebhookOnStore then return end
 
     task.spawn(function()
@@ -220,7 +222,12 @@ local function SendFruitWebhook(eventType, fruitName)
             return
         end
 
-        local fieldTitle = (eventType == "Stored") and "Stored Fruit" or "Picked Fruit"
+        local fieldTitles = {
+            Picked = "Picked Fruit",
+            Random = "Random Fruit",
+            Stored = "Stored Fruit",
+        }
+        local fieldTitle = fieldTitles[eventType] or "Fruit"
         local cleanFruitName = tostring(fruitName or "Unknown Fruit")
         local playerName = lp and lp.Name or "Unknown"
         local timeString = os.date("%Y-%m-%d %H:%M:%S")
@@ -1601,6 +1608,7 @@ local function RandomFruit()
 
     if result and result ~= false then
         Log("Remote Random Fruit thành công: " .. tostring(result))
+        SendFruitWebhook("Random", result)
         task.wait(1)
         StoreFruitInBackpack(true)
         return true, "Bought", result
