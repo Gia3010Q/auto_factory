@@ -11,6 +11,7 @@
     ✅ Auto tìm Fruit rơi trong map
     ✅ Auto tele đến Fruit và nhặt
     ✅ Auto Random Devil Fruit từ xa qua Cousin remote
+    ✅ Tự đóng SpinnerWindow và thông báo nhận Fruit
     ✅ Auto lưu Fruit vừa nhặt vào Storage
     ✅ Anti-AFK, tránh bị kick khi treo máy
     ✅ GUI đẹp có thể kéo, nút STOP, hiện trạng thái
@@ -20,6 +21,28 @@
     2. Để ít nhất 1 Fighting Style (ToolTip = Melee) trong Backpack
     3. Dừng bằng nút STOP hoặc:  getgenv().AutoFactory = false
 ]]
+
+-- Chọn team trước khi khởi tạo Auto Factory.
+repeat task.wait() until game:IsLoaded()
+
+local startupEnv = getgenv()
+if startupEnv.MyTeam ~= "Pirates" and startupEnv.MyTeam ~= "Marines" then
+    startupEnv.MyTeam = "Marines"
+end
+
+local teamSetOk, teamSetError = pcall(function()
+    local replicatedStorage = game:GetService("ReplicatedStorage")
+    local remotes = replicatedStorage:WaitForChild("Remotes", 10)
+    local commF = remotes and remotes:WaitForChild("CommF_", 10)
+    if not commF then error("Không tìm thấy Remotes.CommF_") end
+    commF:InvokeServer("SetTeam", startupEnv.MyTeam)
+end)
+
+if teamSetOk then
+    print("[AutoFactory] Đã set team: " .. tostring(startupEnv.MyTeam))
+else
+    warn("[AutoFactory] Set team thất bại: " .. tostring(teamSetError))
+end
 
 -- ─────────────────────────────────────────────
 -- SERVICES
@@ -48,7 +71,7 @@ local CFG = {
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     AttackNoAnimation = true, -- RegisterAttack(0) + RegisterHit, không chạy animation
     RemoteAttackDelay = 0,    -- Bản gốc không có client cooldown
-    MoveSpeed         = 280,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
+    MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     TravelForce       = 1e5,  -- Lực float nhẹ khi đang bay, giữ chuyển động mượt
     CoreHoldForce     = 9e9,  -- Cùng mức FlyGuiV3 để Core không hất nhân vật ra
     CoreSnapDistance  = 4,    -- Chỉ snap đoạn cuối rất ngắn, tránh giật từ xa
@@ -64,6 +87,9 @@ local CFG = {
     StoreRetryDelay = 15,   -- Thử lại Fruit bị server từ chối/lỗi tạm thời
     AutoRandomFruit = true, -- Random Fruit từ xa, không cần tới NPC Cousin
     RandomFruitInterval = 0.5, -- Chu kỳ kiểm tra remote
+    AutoCloseSpinner = true, -- Tự đóng giao diện quay sau khi CloseButton xuất hiện
+    AutoHideItemNotice = true, -- Tự ẩn Item/ItemUI sau khi nhận Fruit
+    AutoCloseUICheckDelay = 0.2, -- Chu kỳ kiểm tra UI
 
     -- Combat: chỉ dùng Fighting Style, không fallback vũ khí khác
     AutoEquipMelee = true,
@@ -125,6 +151,81 @@ globalEnv.AutoFactory = true
 local function Log(msg)
     if CFG.Debug then print("[AutoFactory] " .. tostring(msg)) end
 end
+
+-- Tích hợp từ bản standalone đã được kiểm thử thực tế. Controller được nạp
+-- riêng để việc chờ module UI không chặn Factory/Buso/Random Fruit khởi động.
+local SpinnerController = nil
+task.spawn(function()
+    if not CFG.AutoCloseSpinner then return end
+
+    local success, result = pcall(function()
+        local controllers = ReplicatedStorage:WaitForChild("Controllers", 10)
+        local ui = controllers and controllers:WaitForChild("UI", 10)
+        local spinnerModule = ui and ui:WaitForChild("Spinner", 10)
+        if not spinnerModule then error("Không tìm thấy Controllers.UI.Spinner") end
+        return require(spinnerModule)
+    end)
+    if success and type(result) == "table"
+        and globalEnv.AutoFactory
+        and globalEnv.AutoFactoryRunToken == runToken then
+        SpinnerController = result
+        Log("Auto Close: Spinner controller ready")
+    else
+        Log("Auto Close: không load được Spinner controller: " .. tostring(result))
+    end
+end)
+
+-- Dùng một loop cho cả hai GUI và buộc vào runToken. Khi bấm STOP hoặc chạy
+-- lại script, loop cũ tự thoát nên không tích lũy task quét PlayerGui.
+task.spawn(function()
+    local checkDelay = math.max(
+        tonumber(CFG.AutoCloseUICheckDelay) or 0.2,
+        0.05
+    )
+
+    while globalEnv.AutoFactory and globalEnv.AutoFactoryRunToken == runToken do
+        task.wait(checkDelay)
+        if not globalEnv.AutoFactory
+            or globalEnv.AutoFactoryRunToken ~= runToken then
+            break
+        end
+
+        pcall(function()
+            local currentPlayerGui = lp:FindFirstChild("PlayerGui")
+            if not currentPlayerGui then return end
+
+            if CFG.AutoCloseSpinner then
+                local spinnerWindow = currentPlayerGui:FindFirstChild("SpinnerWindow")
+                if spinnerWindow and spinnerWindow.Enabled then
+                    local aboveSpinner = spinnerWindow:FindFirstChild("AboveSpinner")
+                    local navigation = aboveSpinner
+                        and aboveSpinner:FindFirstChild("Navigation")
+                    local closeButton = navigation
+                        and navigation:FindFirstChild("CloseButton")
+
+                    if closeButton and closeButton.Visible then
+                        if SpinnerController
+                            and type(SpinnerController.Close) == "function" then
+                            SpinnerController:Close()
+                        else
+                            spinnerWindow.Enabled = false
+                        end
+                        Log("Auto Close: đã đóng SpinnerWindow")
+                    end
+                end
+            end
+
+            if CFG.AutoHideItemNotice then
+                local itemNotice = currentPlayerGui:FindFirstChild("Item")
+                    or currentPlayerGui:FindFirstChild("ItemUI")
+                if itemNotice and itemNotice.Enabled then
+                    itemNotice.Enabled = false
+                    Log("Auto Close: đã ẩn ItemUI")
+                end
+            end
+        end)
+    end
+end)
 
 -- Roblox phát Idled trước khi kick vì không hoạt động. Kết nối này được đưa vào
 -- AutoFactoryConnections nên chạy lại script không tạo nhiều anti-AFK song song.
@@ -1672,7 +1773,7 @@ task.spawn(function()
         end
         waitTick = waitTick + 1
         local dots = string.rep(".", (waitTick % 3) + 1)
-        lblMode.Text = "🔍 Chờ Core" .. dots
+        lblMode.Text = "🔍 Tìm Core" .. dots
         lblBoss.Text = "💀 Boss: Chờ spawn..."
 
         if CFG.FruitEnabled then
