@@ -7,6 +7,7 @@
 
     TÍNH NĂNG:
     ✅ Auto tìm & đánh boss Core (Factory Sea 2)
+    ✅ Dùng Entrance Mansion khi ở xa để tới Factory nhanh hơn
     ✅ Tự bật Buso Haki khi chạy script và sau khi respawn
     ✅ Auto tìm Fruit rơi trong map
     ✅ Auto tele đến Fruit và nhặt
@@ -77,6 +78,9 @@ local CFG = {
     CoreSnapDistance  = 4,    -- Chỉ snap đoạn cuối rất ngắn, tránh giật từ xa
     CoreHoldTolerance = 6,    -- Core đẩy lệch quá mức này thì khóa trả về điểm đánh
     FruitSnapDistance = 8,    -- toTarget(cf, true): ngưỡng gốc
+    UseFactoryEntrance = true, -- Khi ở xa, requestEntrance tới Mansion trước
+    FactoryEntranceMinDistance = 3000, -- Chỉ dùng Entrance nếu cách Factory ít nhất 3000 studs
+    FactoryEntranceCooldown = 2, -- Tránh spam requestEntrance nếu server không dịch chuyển
 
     -- Fruit
     FruitEnabled  = true,   -- Bật/tắt tính năng tìm fruit
@@ -100,6 +104,14 @@ local CFG = {
     UseBusoKeyFallback = true, -- Dùng phím J nếu remote không bật được Buso
     AntiAFK        = true,
     Debug          = false,
+}
+
+-- Route Sea 2 lấy từ teleport_islands.lua. Mansion cách Factory khoảng 1.3k
+-- studs nên route này rút ngắn đáng kể hành trình từ các khu vực xa.
+local EntranceRoutes = {
+    Sea2 = {
+        ["Mansion"] = Vector3.new(-286.99, 306.14, 597.82),
+    },
 }
 
 -- ─────────────────────────────────────────────
@@ -545,6 +557,7 @@ local moveState = {
     previousPlatformStand = nil,
     platformHumanoid = nil,
     addedTeleportTag = false,
+    entranceCooldown = 0,
 }
 
 local function MarkTeleporting()
@@ -667,6 +680,69 @@ local function CancelMove(restoreCharacter)
     moveState.snapDistance = 0
     moveState.speed = 0
     if restoreCharacter then RestoreMoveCharacter() end
+end
+
+-- Khi Core xuất hiện ở quá xa, dùng requestEntrance tới Mansion rồi tiếp tục
+-- bay bằng ToTarget hiện tại. Remote lỗi/không dịch chuyển sẽ tự fallback bay.
+local function TryFactoryEntrance(targetPosition)
+    if not CFG.UseFactoryEntrance or typeof(targetPosition) ~= "Vector3" then
+        return false, "EntranceDisabled"
+    end
+
+    local hrp = GetHRP()
+    local humanoid = GetHumanoid()
+    if not hrp or not humanoid or humanoid.Health <= 0 then
+        return false, "CharacterNotReady"
+    end
+
+    local minDistance = math.max(
+        tonumber(CFG.FactoryEntranceMinDistance) or 3000,
+        0
+    )
+    local directDistance = (hrp.Position - targetPosition).Magnitude
+    if directDistance < minDistance then
+        return false, "EntranceNotNeeded"
+    end
+    if tick() < (moveState.entranceCooldown or 0) then
+        return false, "EntranceCooldown"
+    end
+
+    local entrance = EntranceRoutes.Sea2 and EntranceRoutes.Sea2["Mansion"]
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local commF = remotes and remotes:FindFirstChild("CommF_")
+    if not entrance or not commF then
+        return false, "EntranceUnavailable"
+    end
+
+    moveState.entranceCooldown = tick() + math.max(
+        tonumber(CFG.FactoryEntranceCooldown) or 2,
+        0.5
+    )
+
+    CancelMove(true)
+    MarkTeleporting()
+    local oldPosition = hrp.Position
+    local requestOk, requestError = pcall(function()
+        commF:InvokeServer("requestEntrance", entrance)
+    end)
+    if not requestOk then
+        RestoreMoveCharacter()
+        Log("Factory Entrance lỗi: " .. tostring(requestError))
+        return false, "EntranceRemoteError"
+    end
+
+    task.wait(0.2)
+    local newRoot = GetHRP()
+    local moved = newRoot
+        and (newRoot.Position - oldPosition).Magnitude > 100
+    if newRoot then StopRootVelocity(newRoot) end
+    RestoreMoveCharacter()
+
+    if moved then
+        Log("Đã dùng Entrance Mansion để tới gần Factory")
+        return true, "EntranceMansion"
+    end
+    return false, "EntranceRejected"
 end
 
 -- Giữ nhân vật ổn định khi đã vào tầm Core. BodyVelocity triệt vận tốc/rơi;
@@ -1714,6 +1790,15 @@ task.spawn(function()
             else
                 coreTargetPosition = bossHRP.Position + Vector3.new(0, coreOffsetY, 0)
             end
+
+            -- Ưu tiên route nhanh khi đang ở rất xa. Sau Entrance, vòng kế
+            -- tiếp sẽ dùng cùng ToTarget/MoveSpeed để bay nốt tới điểm Factory.
+            local entranceUsed = TryFactoryEntrance(coreTargetPosition)
+            if entranceUsed then
+                lblMode.Text = "🌀 Entrance Mansion → Factory"
+                continue
+            end
+
             local coreTargetRotation = hrp.CFrame.Rotation
             if moveState.purpose == "Core" and moveState.target then
                 coreTargetRotation = moveState.target.Rotation
