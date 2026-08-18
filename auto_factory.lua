@@ -29,22 +29,36 @@
 repeat task.wait() until game:IsLoaded()
 
 local startupEnv = getgenv()
+local startupPlayer = game:GetService("Players").LocalPlayer
+local currentTeam = startupPlayer and startupPlayer.Team
+local currentTeamName = currentTeam and currentTeam.Name or nil
+
+-- Nếu người chơi đã tự chọn team thì giữ nguyên lựa chọn đó. Chỉ dùng Marines
+-- làm mặc định khi cả cấu hình lẫn team hiện tại đều chưa hợp lệ.
 if startupEnv.MyTeam ~= "Pirates" and startupEnv.MyTeam ~= "Marines" then
-    startupEnv.MyTeam = "Marines"
+    if currentTeamName == "Pirates" or currentTeamName == "Marines" then
+        startupEnv.MyTeam = currentTeamName
+    else
+        startupEnv.MyTeam = "Marines"
+    end
 end
 
-local teamSetOk, teamSetError = pcall(function()
-    local replicatedStorage = game:GetService("ReplicatedStorage")
-    local remotes = replicatedStorage:WaitForChild("Remotes", 10)
-    local commF = remotes and remotes:WaitForChild("CommF_", 10)
-    if not commF then error("Không tìm thấy Remotes.CommF_") end
-    commF:InvokeServer("SetTeam", startupEnv.MyTeam)
-end)
-
-if teamSetOk then
-    print("[AutoFactory] Đã set team: " .. tostring(startupEnv.MyTeam))
+if currentTeamName == startupEnv.MyTeam then
+    print("[AutoFactory] Đã ở đúng team, bỏ qua SetTeam: " .. currentTeamName)
 else
-    warn("[AutoFactory] Set team thất bại: " .. tostring(teamSetError))
+    local teamSetOk, teamSetError = pcall(function()
+        local replicatedStorage = game:GetService("ReplicatedStorage")
+        local remotes = replicatedStorage:WaitForChild("Remotes", 10)
+        local commF = remotes and remotes:WaitForChild("CommF_", 10)
+        if not commF then error("Không tìm thấy Remotes.CommF_") end
+        commF:InvokeServer("SetTeam", startupEnv.MyTeam)
+    end)
+
+    if teamSetOk then
+        print("[AutoFactory] Đã set team: " .. tostring(startupEnv.MyTeam))
+    else
+        warn("[AutoFactory] Set team thất bại: " .. tostring(teamSetError))
+    end
 end
 
 -- ─────────────────────────────────────────────
@@ -75,7 +89,7 @@ local CFG = {
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     AttackNoAnimation = true, -- RegisterAttack(0) + RegisterHit, không chạy animation
     RemoteAttackDelay = 0,    -- Bản gốc không có client cooldown
-    MoveSpeed         = 280,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
+    MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     TravelForce       = 1e5,  -- Lực float nhẹ khi đang bay, giữ chuyển động mượt
     CoreHoldForce     = 9e9,  -- Cùng mức FlyGuiV3 để Core không hất nhân vật ra
     CoreSnapDistance  = 4,    -- Chỉ snap đoạn cuối rất ngắn, tránh giật từ xa
