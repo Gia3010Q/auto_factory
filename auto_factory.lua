@@ -14,13 +14,15 @@
     ✅ Auto Random Devil Fruit từ xa qua Cousin remote
     ✅ Tự đóng SpinnerWindow và thông báo nhận Fruit
     ✅ Auto lưu Fruit vừa nhặt vào Storage
+    ✅ Discord Webhook thông báo khi nhặt và lưu Fruit
     ✅ Anti-AFK, tránh bị kick khi treo máy
     ✅ GUI đẹp có thể kéo, nút STOP, hiện trạng thái
 
     CÁCH DÙNG:
     1. Paste vào executor và chạy
     2. Để ít nhất 1 Fighting Style (ToolTip = Melee) trong Backpack
-    3. Dừng bằng nút STOP hoặc:  getgenv().AutoFactory = false
+    3. Dán link Webhook vào CFG.WebhookURL hoặc: getgenv().WebhookURL = "..."
+    4. Dừng bằng nút STOP hoặc:  getgenv().AutoFactory = false
 ]]
 
 -- Chọn team trước khi khởi tạo Auto Factory.
@@ -55,6 +57,7 @@ local UserInputService  = game:GetService("UserInputService")
 local VIM               = game:GetService("VirtualInputManager")
 local VirtualUser       = game:GetService("VirtualUser")
 local CollectionService = game:GetService("CollectionService")
+local HttpService       = game:GetService("HttpService")
 
 local lp = Players.LocalPlayer
 
@@ -95,6 +98,19 @@ local CFG = {
     AutoHideItemNotice = true, -- Tự ẩn Item/ItemUI sau khi nhận Fruit
     AutoCloseUICheckDelay = 0.2, -- Chu kỳ kiểm tra UI
 
+    -- Webhook Discord (Thông báo nhặt & lưu trái)
+    WebhookEnabled    = true,  -- Bật/tắt gửi Webhook
+    WebhookURL        = "",    -- Dán link Webhook Discord vào đây (hoặc getgenv().WebhookURL = "...")
+    WebhookPing       = "@everyone", -- "@everyone", "" (không ping) hoặc "<@ID_CỦA_BẠN>"
+    WebhookOnPickup   = true,  -- Gửi webhook khi nhặt được trái trên map
+    WebhookOnStore    = true,  -- Gửi webhook khi cất trái vào Storage thành công
+    WebhookUsername   = "Noti Fruit",
+    WebhookAvatarURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539261907322540132/ChatGPT_Image_20_16_58_18_thg_8_2026.png?ex=6a85acdc&is=6a845b5c&hm=5e89b948085f846878ad8da74600c4bc33b2bf6f13c95ec0aa69fa1bcfbb7e2b",
+    WebhookBannerURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539262844946747572/ChatGPT_Image_20_20_42_18_thg_8_2026.png?ex=6a85adbc&is=6a845c3c&hm=808d7d86143e28c46db2303d5855db93d5a465678c1a0cbd1398db3e23e3de74",
+    WebhookTitle      = "Noti Fruit",
+    WebhookFooterText = "Dev By Gia ",
+    WebhookColor      = 16776960,
+
     -- Combat: chỉ dùng Fighting Style, không fallback vũ khí khác
     AutoEquipMelee = true,
     AutoBuso       = true,   -- Luôn giữ Buso bật, kể cả sau khi respawn
@@ -124,6 +140,16 @@ globalEnv.AutoBuso = false
 globalEnv.AutoBusoRunToken = {}
 if type(globalEnv.AutoHakiConfig) == "table" then
     globalEnv.AutoHakiConfig.AutoBuso = false
+end
+
+-- Auto Factory cần độc quyền điều khiển HumanoidRootPart trong lúc chạy.
+-- Chỉ dừng hành trình hiện tại, không Destroy Island Teleport/GUI để người dùng
+-- có thể bật lại sau khi Auto Factory kết thúc.
+if type(globalEnv.IslandTeleport) == "table"
+    and type(globalEnv.IslandTeleport.Stop) == "function" then
+    pcall(function()
+        globalEnv.IslandTeleport:Stop()
+    end)
 end
 
 -- Test tele dùng BodyVelocity riêng; dừng nó trước khi Auto Factory sở hữu
@@ -162,6 +188,113 @@ globalEnv.AutoFactory = true
 -- ─────────────────────────────────────────────
 local function Log(msg)
     if CFG.Debug then print("[AutoFactory] " .. tostring(msg)) end
+end
+
+local function GetHttpRequest()
+    return (syn and syn.request)
+        or (http and http.request)
+        or http_request
+        or request
+        or (fluxus and fluxus.request)
+end
+
+local function SendFruitWebhook(eventType, fruitName)
+    if not CFG.WebhookEnabled then return end
+    local webhookUrl = tostring(
+        (globalEnv and globalEnv.WebhookURL)
+        or CFG.WebhookURL
+        or ""
+    ):gsub("^%s+", ""):gsub("%s+$", "")
+
+    if webhookUrl == "" or not string.find(webhookUrl, "http", 1, true) then
+        return
+    end
+
+    if eventType == "Picked" and not CFG.WebhookOnPickup then return end
+    if eventType == "Stored" and not CFG.WebhookOnStore then return end
+
+    task.spawn(function()
+        local httpRequest = GetHttpRequest()
+        if not httpRequest then
+            Log("Webhook: Executor không hỗ trợ hàm HTTP Request")
+            return
+        end
+
+        local fieldTitle = (eventType == "Stored") and "Stored Fruit" or "Picked Fruit"
+        local cleanFruitName = tostring(fruitName or "Unknown Fruit")
+        local playerName = lp and lp.Name or "Unknown"
+        local timeString = os.date("%Y-%m-%d %H:%M:%S")
+        local isoTimestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+
+        local embedFields = {
+            {
+                name = fieldTitle,
+                value = "```\n" .. cleanFruitName .. "\n```",
+                inline = false,
+            },
+            {
+                name = "Username",
+                value = "||" .. playerName .. "||",
+                inline = true,
+            },
+            {
+                name = "Time",
+                value = timeString,
+                inline = true,
+            },
+            {
+                name = "PlaceId",
+                value = tostring(game.PlaceId),
+                inline = true,
+            },
+        }
+
+        local embed = {
+            title = tostring(CFG.WebhookTitle or "Banana Hub Notification"),
+            description = "**Main Status**\nUsername : ||" .. playerName .. "||",
+            color = tonumber(CFG.WebhookColor) or 16776960,
+            footer = {
+                text = tostring(CFG.WebhookFooterText or "Binini Hub"),
+            },
+            fields = embedFields,
+            thumbnail = {
+                url = tostring(CFG.WebhookBannerURL or "https://cdn.discordapp.com/attachments/1017024488665264218/1262729537578471504/banner_server.jpg"),
+            },
+            timestamp = isoTimestamp,
+        }
+
+        local payload = {
+            content = tostring(CFG.WebhookPing or ""),
+            username = tostring(CFG.WebhookUsername or "Binini Hub"),
+            avatar_url = tostring(CFG.WebhookAvatarURL or "https://images-ext-1.discordapp.net/external/9LSZu__Uvs7I0N8MWag-JmwF2iT-pHCHSe2UdixGEXQ/%3Fsize%3D4096/https/cdn.discordapp.com/avatars/1262364141968949308/a_0c5fb64e2cbb35d029d73b44576c6a60.gif"),
+            embeds = { embed },
+        }
+
+        local encodeOk, jsonBody = pcall(function()
+            return HttpService:JSONEncode(payload)
+        end)
+        if not encodeOk or not jsonBody then
+            Log("Webhook JSONEncode error: " .. tostring(jsonBody))
+            return
+        end
+
+        local postOk, response = pcall(function()
+            return httpRequest({
+                Url = webhookUrl,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json",
+                },
+                Body = jsonBody,
+            })
+        end)
+
+        if postOk then
+            Log("Webhook [" .. eventType .. "] đã gửi thành công: " .. cleanFruitName)
+        else
+            Log("Webhook [" .. eventType .. "] gửi thất bại: " .. tostring(response))
+        end
+    end)
 end
 
 -- Tích hợp từ bản standalone đã được kiểm thử thực tế. Controller được nạp
@@ -1349,6 +1482,7 @@ local function StoreFruitInBackpack(bypassCooldown)
                 if ok and not IsInPlayerInventory(item) then
                     stored = stored + 1
                     Log("Stored: " .. itemName)
+                    SendFruitWebhook("Stored", itemName)
                 elseif ok then
                     -- Remote đã xử lý nhưng Tool vẫn còn: kho đầy/đủ giới hạn
                     -- hoặc server từ chối. Ghi nhớ để không spam lại Fruit này.
@@ -1872,6 +2006,7 @@ task.spawn(function()
                 local picked, pickupStatus = PickupFruit(fruit)
                 if picked then
                     lblFruit.Text = "✅ Đã nhặt: " .. fruitName
+                    SendFruitWebhook("Picked", fruitName)
                 elseif pickupStatus == "Move" or pickupStatus == "Snap"
                     or pickupStatus == "Chưa nhặt được" then
                     lblFruit.Text = "🍎 Đang tiếp cận: " .. fruitName
