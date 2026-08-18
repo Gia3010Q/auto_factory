@@ -75,7 +75,7 @@ local CFG = {
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     AttackNoAnimation = true, -- RegisterAttack(0) + RegisterHit, không chạy animation
     RemoteAttackDelay = 0,    -- Bản gốc không có client cooldown
-    MoveSpeed         = 280,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
+    MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     TravelForce       = 1e5,  -- Lực float nhẹ khi đang bay, giữ chuyển động mượt
     CoreHoldForce     = 9e9,  -- Cùng mức FlyGuiV3 để Core không hất nhân vật ra
     CoreSnapDistance  = 4,    -- Chỉ snap đoạn cuối rất ngắn, tránh giật từ xa
@@ -94,6 +94,7 @@ local CFG = {
     StoreRetryDelay = 15,   -- Thử lại Fruit bị server từ chối/lỗi tạm thời
     AutoRandomFruit = true, -- Random Fruit từ xa, không cần tới NPC Cousin
     RandomFruitInterval = 0.5, -- Chu kỳ kiểm tra remote
+    RandomCooldownCheckDelay = 30, -- Khi đang cooldown, chỉ kiểm tra lại mỗi 30 giây
     AutoCloseSpinner = true, -- Tự đóng giao diện quay sau khi CloseButton xuất hiện
     AutoHideItemNotice = true, -- Tự ẩn Item/ItemUI sau khi nhận Fruit
     AutoCloseUICheckDelay = 0.2, -- Chu kỳ kiểm tra UI
@@ -1534,6 +1535,7 @@ end
 -- Không teleport và không phụ thuộc NPC/Spinner GUI.
 -- ─────────────────────────────────────────────
 local bannerClient = nil
+local randomPurchaseInProgress = false
 
 local function GetCommF()
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
@@ -1567,6 +1569,71 @@ local function GetActiveRandomFruitBoxName()
     return "DLCBoxData"
 end
 
+-- Remote Cousin có thể trả thông báo lỗi/cooldown dưới dạng chuỗi. Trong Lua,
+-- chuỗi luôn là truthy nên không được dùng `if result then` để kết luận đã mua.
+local function ClassifyRandomFruitResponse(value)
+    if value == nil or value == false then return "Empty" end
+    if type(value) ~= "string" then return "Bought" end
+
+    local message = string.lower(value)
+    if string.find(message, "must wait", 1, true)
+        or string.find(message, "buy another random fruit", 1, true)
+        or string.find(message, "cooldown", 1, true)
+        or string.find(message, "come back later", 1, true) then
+        return "Cooldown"
+    end
+
+    if string.find(message, "not enough", 1, true)
+        or string.find(message, "need more", 1, true)
+        or string.find(message, "low level", 1, true)
+        or string.find(message, "cannot buy", 1, true)
+        or string.find(message, "can't buy", 1, true)
+        or string.find(message, "failed", 1, true)
+        or string.find(message, "error", 1, true) then
+        return "BuyRejected"
+    end
+
+    return "Bought"
+end
+
+local function SnapshotOwnedFruitTools()
+    local snapshot = {}
+    local function scan(container)
+        if not container then return end
+        for _, item in ipairs(container:GetChildren()) do
+            if IsFruitTool(item) then
+                snapshot[item] = true
+            end
+        end
+    end
+    scan(lp:FindFirstChild("Backpack"))
+    scan(GetChar())
+    return snapshot
+end
+
+local function WaitForNewOwnedFruit(snapshot, timeout)
+    local deadline = tick() + math.max(tonumber(timeout) or 3, 0.5)
+    repeat
+        local function findIn(container)
+            if not container then return nil end
+            for _, item in ipairs(container:GetChildren()) do
+                if not snapshot[item] and IsFruitTool(item) then
+                    return item
+                end
+            end
+            return nil
+        end
+
+        local fruit = findIn(lp:FindFirstChild("Backpack")) or findIn(GetChar())
+        if fruit then return fruit end
+        if not globalEnv.AutoFactory or globalEnv.AutoFactoryRunToken ~= runToken then
+            return nil
+        end
+        task.wait(0.1)
+    until tick() >= deadline
+    return nil
+end
+
 local function RandomFruit()
     local commF = GetCommF()
     if not commF then return false, "RemoteError", "Không tìm thấy CommF_" end
@@ -1586,35 +1653,69 @@ local function RandomFruit()
         return false, "Low Level", playerLevel
     end
 
-    local isReady = nil
-    pcall(function()
-        isReady = commF:InvokeServer("Cousin", "CheckTime", boxName)
+    local timeOk, isReady = pcall(function()
+        return commF:InvokeServer("Cousin", "CheckTime", boxName)
     end)
-    if isReady == false then
-        return false, "Cooldown"
+    if not timeOk then
+        return false, "RemoteError", tostring(isReady)
+    end
+    if isReady == false or ClassifyRandomFruitResponse(isReady) == "Cooldown" then
+        return false, "Cooldown", isReady
     end
 
-    local result = nil
-    pcall(function()
-        result = commF:InvokeServer("Cousin", boxName)
-    end)
+    local fruitSnapshot = SnapshotOwnedFruitTools()
+    randomPurchaseInProgress = true
 
-    -- Fallback cũ dành cho server/executor không nhận boxName.
-    if result == nil or result == false then
-        pcall(function()
+    local transactionOk, outcome = xpcall(function()
+        local result = commF:InvokeServer("Cousin", boxName)
+        local responseStatus = ClassifyRandomFruitResponse(result)
+
+        if responseStatus == "Cooldown" then
+            return { status = "Cooldown", detail = result }
+        elseif responseStatus == "BuyRejected" then
+            return { status = "BuyRejected", detail = result }
+        end
+
+        -- Fallback cũ dành cho server/executor không nhận boxName.
+        if result == nil or result == false then
             result = commF:InvokeServer("Cousin")
-        end)
+            responseStatus = ClassifyRandomFruitResponse(result)
+            if responseStatus == "Cooldown" then
+                return { status = "Cooldown", detail = result }
+            elseif responseStatus == "BuyRejected" then
+                return { status = "BuyRejected", detail = result }
+            end
+        end
+
+        -- Chỉ xác nhận thành công khi thật sự có một Tool Fruit mới xuất hiện.
+        local newFruit = WaitForNewOwnedFruit(fruitSnapshot, 3)
+        if not newFruit then
+            return { status = "BuyUnconfirmed", detail = result }
+        end
+
+        return {
+            status = "Bought",
+            fruit = newFruit,
+            fruitName = newFruit.Name,
+            detail = result,
+        }
+    end, function(err)
+        return tostring(err)
+    end)
+
+    randomPurchaseInProgress = false
+
+    if not transactionOk then
+        return false, "RemoteError", tostring(outcome)
+    end
+    if outcome.status ~= "Bought" then
+        return false, outcome.status, outcome.detail
     end
 
-    if result and result ~= false then
-        Log("Remote Random Fruit thành công: " .. tostring(result))
-        SendFruitWebhook("Random", result)
-        task.wait(1)
-        StoreFruitInBackpack(true)
-        return true, "Bought", result
-    end
-
-    return false, "BuyRejected", result
+    Log("Remote Random Fruit xác nhận nhận được: " .. outcome.fruitName)
+    SendFruitWebhook("Random", outcome.fruitName)
+    StoreFruitInBackpack(true)
+    return true, "Bought", outcome.fruitName
 end
 
 -- ─────────────────────────────────────────────
@@ -1778,6 +1879,11 @@ task.spawn(function()
             continue
         end
 
+        if randomPurchaseInProgress then
+            lblStore.Text = "📦 Chờ xác nhận Fruit vừa Random..."
+            continue
+        end
+
         local core = FindCore()
         if core and IsMobAlive(core) then
             lblStore.Text = "📦 Storage: Tạm dừng khi đánh Core"
@@ -1823,6 +1929,7 @@ end)
 
 -- Remote Random Fruit chạy riêng để InvokeServer không làm chậm vòng ưu tiên Core.
 task.spawn(function()
+    local retryAt = 0
     while globalEnv.AutoFactory
         and globalEnv.AutoFactoryRunToken == runToken
         and sg.Parent do
@@ -1834,23 +1941,38 @@ task.spawn(function()
         end
 
         if CFG.AutoRandomFruit then
+            if tick() < retryAt then continue end
             local callOk, bought, status, detail = pcall(RandomFruit)
             if not callOk then
                 lblRandom.Text = "⚠️ Random lỗi: " .. tostring(bought)
+                retryAt = tick() + 3
             elseif bought then
                 lblRandom.Text = "✅ Remote Random: Thành công"
+                retryAt = 0
             elseif status == "Low Level" then
                 lblRandom.Text = "🎲 Random: Cần cấp 50"
+                retryAt = tick() + 30
             elseif status == "Cooldown" then
                 lblRandom.Text = "🎲 Random: Đang chờ cooldown"
+                retryAt = tick() + math.max(
+                    tonumber(CFG.RandomCooldownCheckDelay) or 30,
+                    1
+                )
             elseif status == "BuyRejected" then
                 lblRandom.Text = "⚠️ Remote Random: Server từ chối"
+                retryAt = tick() + 5
+            elseif status == "BuyUnconfirmed" then
+                lblRandom.Text = "⚠️ Random: Không thấy Fruit mới"
+                retryAt = tick() + 5
             elseif status == "RemoteError" then
                 lblRandom.Text = "⚠️ Remote Random: " .. tostring(detail)
+                retryAt = tick() + 3
             else
                 lblRandom.Text = "⚠️ Random: " .. tostring(status or "Không thực hiện được")
+                retryAt = tick() + 3
             end
         else
+            retryAt = 0
             lblRandom.Text = "🎲 Random Fruit: Đã tắt"
         end
     end
