@@ -89,7 +89,7 @@ local CFG = {
     UseCombatRemotes = true, -- AttackFunction gốc; lỗi thì fallback input
     AttackNoAnimation = true, -- RegisterAttack(0) + RegisterHit, không chạy animation
     RemoteAttackDelay = 0,    -- Bản gốc không có client cooldown
-    MoveSpeed         = 280,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
+    MoveSpeed         = 300,  -- Tốc độ di chuyển chung tới Core và Fruit (studs/s)
     TravelForce       = 1e5,  -- Lực float nhẹ khi đang bay, giữ chuyển động mượt
     CoreHoldForce     = 9e9,  -- Cùng mức FlyGuiV3 để Core không hất nhân vật ra
     CoreSnapDistance  = 4,    -- Chỉ snap đoạn cuối rất ngắn, tránh giật từ xa
@@ -555,6 +555,84 @@ local function IsFruitTool(item)
     local handle = item:FindFirstChild("Handle")
     return handle ~= nil and handle:IsA("BasePart")
 end
+
+local function NormalizeFruitDisplayName(value)
+    if type(value) ~= "string" then return nil end
+    local name = value:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" or string.lower(name) == "fruit" then return nil end
+
+    -- OriginalName thường có dạng "Magma-Magma"; đổi thành tên dễ đọc.
+    local first, second = string.match(name, "^([^%-]+)%-(.+)$")
+    if first and second and string.lower(first) == string.lower(second) then
+        return first .. " Fruit"
+    end
+    return name
+end
+
+local function ResolveFruitDisplayName(item)
+    if not item then return nil end
+
+    local directName = NormalizeFruitDisplayName(item.Name)
+    if directName then return directName end
+
+    for _, attributeName in ipairs({ "OriginalName", "FruitName" }) do
+        local ok, attributeValue = pcall(function()
+            return item:GetAttribute(attributeName)
+        end)
+        local resolved = ok and NormalizeFruitDisplayName(attributeValue) or nil
+        if resolved then return resolved end
+    end
+
+    for _, valueName in ipairs({ "OriginalName", "FruitName" }) do
+        local valueObject = item:FindFirstChild(valueName)
+        if valueObject and valueObject:IsA("StringValue") then
+            local resolved = NormalizeFruitDisplayName(valueObject.Value)
+            if resolved then return resolved end
+        end
+    end
+
+    return nil
+end
+
+local function SnapshotOwnedFruitTools()
+    local snapshot = {}
+    local function scan(container)
+        if not container then return end
+        for _, item in ipairs(container:GetChildren()) do
+            if IsFruitTool(item) then
+                snapshot[item] = true
+            end
+        end
+    end
+    scan(lp:FindFirstChild("Backpack"))
+    scan(GetChar())
+    return snapshot
+end
+
+local function WaitForNewOwnedFruit(snapshot, timeout)
+    local deadline = tick() + math.max(tonumber(timeout) or 3, 0.5)
+    repeat
+        local function findIn(container)
+            if not container then return nil end
+            for _, item in ipairs(container:GetChildren()) do
+                if not snapshot[item] and IsFruitTool(item) then
+                    return item
+                end
+            end
+            return nil
+        end
+
+        local fruit = findIn(lp:FindFirstChild("Backpack")) or findIn(GetChar())
+        if fruit then return fruit end
+        if not globalEnv.AutoFactory or globalEnv.AutoFactoryRunToken ~= runToken then
+            return nil
+        end
+        task.wait(0.1)
+    until tick() >= deadline
+    return nil
+end
+
+local worldFruitPickupInProgress = false
 
 local function FindMeleeIn(container)
     if not container then return nil end
@@ -1318,6 +1396,9 @@ local function PickupFruit(fruit)
     local dist = (hrp.Position - handle.Position).Magnitude
 
     if dist <= CFG.PickupDist then
+        local fruitSnapshot = SnapshotOwnedFruitTools()
+        worldFruitPickupInProgress = true
+
         -- Đủ gần → nhảy để trigger pickup (theo gốc dùng VirtualInputManager Space)
         local inputOk, inputError = pcall(function()
             VIM:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
@@ -1328,17 +1409,22 @@ local function PickupFruit(fruit)
             pcall(function()
                 VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
             end)
+            worldFruitPickupInProgress = false
             return false, "Input nhặt Fruit lỗi: " .. tostring(inputError)
         end
-        task.wait(0.3)
 
+        local newOwnedFruit = WaitForNewOwnedFruit(fruitSnapshot, 2)
+        worldFruitPickupInProgress = false
         local char = GetChar()
         local backpack = lp:FindFirstChild("Backpack")
-        local picked = not fruit.Parent
+        local picked = newOwnedFruit ~= nil
+            or not fruit.Parent
             or (char and fruit:IsDescendantOf(char))
             or (backpack and fruit:IsDescendantOf(backpack))
+        local pickedFruitName = ResolveFruitDisplayName(newOwnedFruit)
+            or ResolveFruitDisplayName(fruit)
         Log(picked and "Pickup fruit thành công" or "Đã bấm Space nhưng chưa nhặt được fruit")
-        return picked, picked and "Picked" or "Chưa nhặt được"
+        return picked, picked and "Picked" or "Chưa nhặt được", pickedFruitName
     else
         -- Source gốc gọi toTarget(fruit.Handle.CFrame, true).
         local moved, moveStatus = ToTarget(handle.CFrame, true, "Fruit")
@@ -1610,44 +1696,6 @@ local function ClassifyRandomFruitResponse(value)
     return "Bought"
 end
 
-local function SnapshotOwnedFruitTools()
-    local snapshot = {}
-    local function scan(container)
-        if not container then return end
-        for _, item in ipairs(container:GetChildren()) do
-            if IsFruitTool(item) then
-                snapshot[item] = true
-            end
-        end
-    end
-    scan(lp:FindFirstChild("Backpack"))
-    scan(GetChar())
-    return snapshot
-end
-
-local function WaitForNewOwnedFruit(snapshot, timeout)
-    local deadline = tick() + math.max(tonumber(timeout) or 3, 0.5)
-    repeat
-        local function findIn(container)
-            if not container then return nil end
-            for _, item in ipairs(container:GetChildren()) do
-                if not snapshot[item] and IsFruitTool(item) then
-                    return item
-                end
-            end
-            return nil
-        end
-
-        local fruit = findIn(lp:FindFirstChild("Backpack")) or findIn(GetChar())
-        if fruit then return fruit end
-        if not globalEnv.AutoFactory or globalEnv.AutoFactoryRunToken ~= runToken then
-            return nil
-        end
-        task.wait(0.1)
-    until tick() >= deadline
-    return nil
-end
-
 local function RandomFruit()
     local commF = GetCommF()
     if not commF then return false, "RemoteError", "Không tìm thấy CommF_" end
@@ -1893,8 +1941,8 @@ task.spawn(function()
             continue
         end
 
-        if randomPurchaseInProgress then
-            lblStore.Text = "📦 Chờ xác nhận Fruit vừa Random..."
+        if randomPurchaseInProgress or worldFruitPickupInProgress then
+            lblStore.Text = "📦 Chờ xác nhận Fruit mới..."
             continue
         end
 
@@ -2143,14 +2191,21 @@ task.spawn(function()
             local fruit, fruitDist = FindFruitInWorld()
             if fruit then
                 fruitMode = true
-                local fruitName = fruit.Name
+                local fruitName = ResolveFruitDisplayName(fruit) or fruit.Name
                 lblMode.Text  = "🍎 Đang nhặt Fruit..."
                 lblFruit.Text = string.format("🍎 %s (%.0fm)", fruitName, fruitDist)
 
-                local picked, pickupStatus = PickupFruit(fruit)
+                local picked, pickupStatus, pickedFruitName = PickupFruit(fruit)
                 if picked then
-                    lblFruit.Text = "✅ Đã nhặt: " .. fruitName
-                    SendFruitWebhook("Picked", fruitName)
+                    local confirmedName = pickedFruitName
+                        or ResolveFruitDisplayName(fruit)
+                    if confirmedName then
+                        lblFruit.Text = "✅ Đã nhặt: " .. confirmedName
+                        SendFruitWebhook("Picked", confirmedName)
+                    else
+                        lblFruit.Text = "✅ Đã nhặt Fruit (chưa xác định tên)"
+                        Log("Bỏ qua webhook Picked vì chưa xác định được tên Fruit")
+                    end
                 elseif pickupStatus == "Move" or pickupStatus == "Snap"
                     or pickupStatus == "Chưa nhặt được" then
                     lblFruit.Text = "🍎 Đang tiếp cận: " .. fruitName
