@@ -122,8 +122,8 @@ local CFG = {
     WebhookOnStore    = true,  -- Gửi webhook khi cất trái vào Storage thành công
     WebhookMinRarity  = "Legendary", -- "Legendary" (chỉ Mythical & Legendary), "Mythical" (chỉ Mythical), "All" (tất cả trái)
     WebhookUsername   = "Noti Fruit",
-    WebhookAvatarURL  = "", -- Chỉ dùng URL ảnh công khai cố định; để trống sẽ không gửi avatar
-    WebhookBannerURL  = "", -- Chỉ dùng URL ảnh công khai cố định; để trống sẽ không gửi thumbnail
+    WebhookAvatarURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539261907322540132/ChatGPT_Image_20_16_58_18_thg_8_2026.png?ex=6a86559c&is=6a85041c&hm=8047a959f2e577dfa08b6133d0deb7e00609931a1ce3794e28a050b9c02cc397", -- Chỉ dùng URL ảnh công khai cố định; để trống sẽ không gửi avatar
+    WebhookBannerURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539262844946747572/ChatGPT_Image_20_20_42_18_thg_8_2026.png?ex=6a86567c&is=6a8504fc&hm=614cfffbc8df63bc0abbe6a9f87bf1ad7e5160b0395ea8861566c9649b9db6bf", -- Chỉ dùng URL ảnh công khai cố định; để trống sẽ không gửi thumbnail
     WebhookTitle      = "Noti Fruit",
     WebhookFooterText = "Dev By Gia ",
     WebhookColor      = 16776960,
