@@ -113,16 +113,17 @@ local CFG = {
     AutoHideItemNotice = true, -- Tự ẩn Item/ItemUI sau khi nhận Fruit
     AutoCloseUICheckDelay = 0.2, -- Chu kỳ kiểm tra UI
 
-    -- Webhook Discord (Thông báo nhặt & lưu trái)
+    -- Webhook Discord (Thông báo nhặt, quay & lưu trái)
     WebhookEnabled    = true,  -- Bật/tắt gửi Webhook
     WebhookURL        = "",    -- Dán link Webhook Discord vào đây (hoặc getgenv().WebhookURL = "...")
     WebhookPing       = "@everyone", -- "@everyone", "" (không ping) hoặc "<@ID_CỦA_BẠN>"
     WebhookOnPickup   = true,  -- Gửi webhook khi nhặt được trái trên map
     WebhookOnRandom   = true,  -- Gửi webhook ngay khi Remote Random thành công
     WebhookOnStore    = true,  -- Gửi webhook khi cất trái vào Storage thành công
+    WebhookMinRarity  = "Legendary", -- "Legendary" (chỉ Mythical & Legendary), "Mythical" (chỉ Mythical), "All" (tất cả trái)
     WebhookUsername   = "Noti Fruit",
-    WebhookAvatarURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539261907322540132/ChatGPT_Image_20_16_58_18_thg_8_2026.png?ex=6a85acdc&is=6a845b5c&hm=5e89b948085f846878ad8da74600c4bc33b2bf6f13c95ec0aa69fa1bcfbb7e2b",
-    WebhookBannerURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539262844946747572/ChatGPT_Image_20_20_42_18_thg_8_2026.png?ex=6a85adbc&is=6a845c3c&hm=808d7d86143e28c46db2303d5855db93d5a465678c1a0cbd1398db3e23e3de74",
+    WebhookAvatarURL  = "", -- Chỉ dùng URL ảnh công khai cố định; để trống sẽ không gửi avatar
+    WebhookBannerURL  = "", -- Chỉ dùng URL ảnh công khai cố định; để trống sẽ không gửi thumbnail
     WebhookTitle      = "Noti Fruit",
     WebhookFooterText = "Dev By Gia ",
     WebhookColor      = 16776960,
@@ -214,6 +215,96 @@ local function GetHttpRequest()
         or (fluxus and fluxus.request)
 end
 
+-- ─────────────────────────────────────────────
+-- CƠ CHẾ ĐỌC RARITY TRỰC TIẾP TỪ GAME
+-- ─────────────────────────────────────────────
+local GameFruitInfo = nil
+
+pcall(function()
+    local fruitInfoModule = ReplicatedStorage:WaitForChild("FruitInfo", 5)
+    if fruitInfoModule then
+        local data = require(fruitInfoModule)
+        if type(data) == "table" and type(data.List) == "table" then
+            GameFruitInfo = data
+        end
+    end
+end)
+
+-- Bảng dự phòng các trái cấp cao (Mythical = 5, Legendary = 4)
+local HIGH_TIER_FRUITS = {
+    -- 🔴 Mythical (Cấp 5 - Đỏ Ruby)
+    kitsune = 5, dragon = 5, leopard = 5, ["t-rex"] = 5, trex = 5,
+    mammoth = 5, dough = 5, shadow = 5, venom = 5, control = 5,
+    spirit = 5, gravity = 5,
+
+    -- 🟣 Legendary (Cấp 4 - Tím Huyền Bí)
+    portal = 4, blizzard = 4, rumble = 4, buddha = 4, sound = 4,
+    phoenix = 4, spider = 4, string = 4, love = 4, pain = 4, paw = 4, quake = 4,
+}
+
+local RARITY_DETAILS = {
+    common    = { rarity = "Common",    level = 1, badge = "⚪ Common",    color = 9807270 },
+    uncommon  = { rarity = "Uncommon",  level = 2, badge = "🟢 Uncommon",  color = 65332 },
+    rare      = { rarity = "Rare",      level = 3, badge = "🔵 Rare",      color = 3447003 },
+    legendary = { rarity = "Legendary", level = 4, badge = "🟣 Legendary", color = 10696174 },
+    mythical  = { rarity = "Mythical",  level = 5, badge = "🔴 Mythical",  color = 16711765 },
+}
+
+local function ReadFruitRarityEntry(entry)
+    if type(entry) ~= "table" then return nil end
+    local rarity = entry.Rarity
+    local rarityName
+    if type(rarity) == "table" then
+        rarityName = rarity.Name
+    elseif type(rarity) == "string" then
+        rarityName = rarity
+    end
+    if type(rarityName) ~= "string" then return nil end
+    return RARITY_DETAILS[string.lower(rarityName)]
+end
+
+local function GetFruitRarity(fruitName)
+    local rawName = tostring(fruitName or "")
+    local clean = rawName:lower():gsub("^%s+", ""):gsub("%s+$", "")
+    local baseName = rawName:gsub("%s+[Ff][Rr][Uu][Ii][Tt]$", "")
+
+    -- FruitInfo.List được game lập chỉ mục bằng storage name, thường có dạng
+    -- "Magma-Magma" trong khi Tool hiển thị là "Magma Fruit".
+    local fruitList = GameFruitInfo and GameFruitInfo.List
+    if type(fruitList) == "table" then
+        local storageName = baseName .. "-" .. baseName
+        local matched = fruitList[rawName]
+            or fruitList[baseName]
+            or fruitList[storageName]
+
+        local rarityInfo = ReadFruitRarityEntry(matched)
+        if rarityInfo then return rarityInfo end
+
+        -- Fallback không phân biệt hoa/thường cho server có key khác casing.
+        local wanted = string.lower(storageName)
+        for key, entry in pairs(fruitList) do
+            if type(key) == "string" and string.lower(key) == wanted then
+                rarityInfo = ReadFruitRarityEntry(entry)
+                if rarityInfo then return rarityInfo end
+                break
+            end
+        end
+    end
+
+    -- 2. Tra cứu từ khóa dự phòng thông minh
+    for name, tier in pairs(HIGH_TIER_FRUITS) do
+        if string.find(clean, name, 1, true) then
+            if tier == 5 then
+                return { rarity = "Mythical", level = 5, badge = "🔴 Mythical", color = 16711765 }
+            else
+                return { rarity = "Legendary", level = 4, badge = "🟣 Legendary", color = 10696174 }
+            end
+        end
+    end
+
+    return { rarity = "Unknown", level = 0, badge = "⚪ Unknown", color = 16776960 }
+end
+
 local function SendFruitWebhook(eventType, fruitName)
     if not CFG.WebhookEnabled then return end
     local webhookUrl = tostring(
@@ -230,6 +321,32 @@ local function SendFruitWebhook(eventType, fruitName)
     if eventType == "Random" and not CFG.WebhookOnRandom then return end
     if eventType == "Stored" and not CFG.WebhookOnStore then return end
 
+    local cleanFruitName = tostring(fruitName or "Unknown Fruit")
+    local rarityInfo = GetFruitRarity(cleanFruitName)
+
+    -- BỘ LỌC CẤP BẬC: Mặc định chỉ thông báo các trái Mythical và Legendary
+    local minRarity = tostring(
+        (globalEnv and globalEnv.WebhookMinRarity)
+        or CFG.WebhookMinRarity
+        or "Legendary"
+    ):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    if minRarity ~= "legendary" and minRarity ~= "mythical" and minRarity ~= "all" then
+        Log("WebhookMinRarity không hợp lệ, dùng mặc định Legendary: " .. minRarity)
+        minRarity = "legendary"
+    end
+
+    if minRarity == "legendary" then
+        if rarityInfo.level < 4 then
+            Log(string.format("Webhook: Bỏ qua trái '%s' (%s) vì dưới mức Legendary/Mythical", cleanFruitName, rarityInfo.rarity))
+            return
+        end
+    elseif minRarity == "mythical" then
+        if rarityInfo.level < 5 then
+            Log(string.format("Webhook: Bỏ qua trái '%s' (%s) vì dưới mức Mythical", cleanFruitName, rarityInfo.rarity))
+            return
+        end
+    end
+
     task.spawn(function()
         local httpRequest = GetHttpRequest()
         if not httpRequest then
@@ -243,7 +360,6 @@ local function SendFruitWebhook(eventType, fruitName)
             Stored = "Stored Fruit",
         }
         local fieldTitle = fieldTitles[eventType] or "Fruit"
-        local cleanFruitName = tostring(fruitName or "Unknown Fruit")
         local playerName = lp and lp.Name or "Unknown"
         local timeString = os.date("%Y-%m-%d %H:%M:%S")
         local isoTimestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
@@ -253,6 +369,11 @@ local function SendFruitWebhook(eventType, fruitName)
                 name = fieldTitle,
                 value = "```\n" .. cleanFruitName .. "\n```",
                 inline = false,
+            },
+            {
+                name = "Rarity",
+                value = rarityInfo.badge,
+                inline = true,
             },
             {
                 name = "Username",
@@ -274,23 +395,28 @@ local function SendFruitWebhook(eventType, fruitName)
         local embed = {
             title = tostring(CFG.WebhookTitle or "Banana Hub Notification"),
             description = "**Main Status**\nUsername : ||" .. playerName .. "||",
-            color = tonumber(CFG.WebhookColor) or 16776960,
+            color = rarityInfo.color or tonumber(CFG.WebhookColor) or 16776960,
             footer = {
-                text = tostring(CFG.WebhookFooterText or "Binini Hub"),
+                text = tostring(CFG.WebhookFooterText or "Dev By Gia "),
             },
             fields = embedFields,
-            thumbnail = {
-                url = tostring(CFG.WebhookBannerURL or "https://cdn.discordapp.com/attachments/1017024488665264218/1262729537578471504/banner_server.jpg"),
-            },
             timestamp = isoTimestamp,
         }
+
+        local bannerUrl = tostring(CFG.WebhookBannerURL or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if bannerUrl ~= "" then
+            embed.thumbnail = { url = bannerUrl }
+        end
 
         local payload = {
             content = tostring(CFG.WebhookPing or ""),
             username = tostring(CFG.WebhookUsername or "Binini Hub"),
-            avatar_url = tostring(CFG.WebhookAvatarURL or "https://images-ext-1.discordapp.net/external/9LSZu__Uvs7I0N8MWag-JmwF2iT-pHCHSe2UdixGEXQ/%3Fsize%3D4096/https/cdn.discordapp.com/avatars/1262364141968949308/a_0c5fb64e2cbb35d029d73b44576c6a60.gif"),
             embeds = { embed },
         }
+        local avatarUrl = tostring(CFG.WebhookAvatarURL or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if avatarUrl ~= "" then
+            payload.avatar_url = avatarUrl
+        end
 
         local encodeOk, jsonBody = pcall(function()
             return HttpService:JSONEncode(payload)
