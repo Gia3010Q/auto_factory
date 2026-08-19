@@ -120,7 +120,7 @@ local CFG = {
     WebhookOnPickup   = true,  -- Gửi webhook khi nhặt được trái trên map
     WebhookOnRandom   = true,  -- Gửi webhook ngay khi Remote Random thành công
     WebhookOnStore    = true,  -- Gửi webhook khi cất trái vào Storage thành công
-    WebhookMinRarity  = "Legendary", -- "Legendary" (chỉ Mythical & Legendary), "Mythical" (chỉ Mythical), "All" (tất cả trái)
+    WebhookMinRarity  = "Legendary", -- Chỉ dùng để lọc webhook; không hiển thị Rarity trên Discord
     WebhookUsername   = "Noti Fruit",
     WebhookAvatarURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539261907322540132/ChatGPT_Image_20_16_58_18_thg_8_2026.png?ex=6a86559c&is=6a85041c&hm=8047a959f2e577dfa08b6133d0deb7e00609931a1ce3794e28a050b9c02cc397", -- Chỉ dùng URL ảnh công khai cố định; để trống sẽ không gửi avatar
     WebhookBannerURL  = "https://cdn.discordapp.com/attachments/1176496808155947030/1539262844946747572/ChatGPT_Image_20_20_42_18_thg_8_2026.png?ex=6a86567c&is=6a8504fc&hm=614cfffbc8df63bc0abbe6a9f87bf1ad7e5160b0395ea8861566c9649b9db6bf", -- Chỉ dùng URL ảnh công khai cố định; để trống sẽ không gửi thumbnail
@@ -273,9 +273,12 @@ local function GetFruitRarity(fruitName)
     local fruitList = GameFruitInfo and GameFruitInfo.List
     if type(fruitList) == "table" then
         local storageName = baseName .. "-" .. baseName
-        local matched = fruitList[rawName]
+        -- Script gốc (deobfuscated.lua dòng 12452) dùng storageName làm key chính.
+        -- Ưu tiên storageName trước để tránh match nhầm khi rawName/baseName trùng
+        -- key khác trong FruitInfo.List.
+        local matched = fruitList[storageName]
+            or fruitList[rawName]
             or fruitList[baseName]
-            or fruitList[storageName]
 
         local rarityInfo = ReadFruitRarityEntry(matched)
         if rarityInfo then return rarityInfo end
@@ -371,11 +374,6 @@ local function SendFruitWebhook(eventType, fruitName)
                 inline = false,
             },
             {
-                name = "Rarity",
-                value = rarityInfo.badge,
-                inline = true,
-            },
-            {
                 name = "Username",
                 value = "||" .. playerName .. "||",
                 inline = true,
@@ -395,7 +393,7 @@ local function SendFruitWebhook(eventType, fruitName)
         local embed = {
             title = tostring(CFG.WebhookTitle or "Banana Hub Notification"),
             description = "**Main Status**\nUsername : ||" .. playerName .. "||",
-            color = rarityInfo.color or tonumber(CFG.WebhookColor) or 16776960,
+            color = tonumber(CFG.WebhookColor) or 16776960,
             footer = {
                 text = tostring(CFG.WebhookFooterText or "Dev By Gia "),
             },
@@ -687,10 +685,17 @@ local function NormalizeFruitDisplayName(value)
     local name = value:gsub("^%s+", ""):gsub("%s+$", "")
     if name == "" or string.lower(name) == "fruit" then return nil end
 
-    -- OriginalName thường có dạng "Magma-Magma"; đổi thành tên dễ đọc.
-    local first, second = string.match(name, "^([^%-]+)%-(.+)$")
-    if first and second and string.lower(first) == string.lower(second) then
-        return first .. " Fruit"
+    -- OriginalName thường lặp lại tên hai lần, ví dụ:
+    -- "Magma-Magma", "T-Rex-T-Rex" hoặc "Dragon (West)-Dragon (West)".
+    -- Thử tất cả dấu '-' để xử lý đúng cả tên có dấu '-' bên trong.
+    for separator = 1, #name do
+        if string.sub(name, separator, separator) == "-" then
+            local first = string.sub(name, 1, separator - 1)
+            local second = string.sub(name, separator + 1)
+            if first ~= "" and string.lower(first) == string.lower(second) then
+                return first .. " Fruit"
+            end
+        end
     end
     return name
 end
@@ -698,18 +703,17 @@ end
 local function ResolveFruitDisplayName(item)
     if not item then return nil end
 
-    local directName = NormalizeFruitDisplayName(item.Name)
-    if directName then return directName end
-
-    for _, attributeName in ipairs({ "OriginalName", "FruitName" }) do
-        local ok, attributeValue = pcall(function()
-            return item:GetAttribute(attributeName)
-        end)
-        local resolved = ok and NormalizeFruitDisplayName(attributeValue) or nil
+    -- Blox Fruits chỉ có attribute "OriginalName" (dạng "Magma-Magma").
+    -- "FruitName" không tồn tại trong game — đã bỏ để tránh match nhầm.
+    local origOk, origValue = pcall(function()
+        return item:GetAttribute("OriginalName")
+    end)
+    if origOk then
+        local resolved = NormalizeFruitDisplayName(origValue)
         if resolved then return resolved end
     end
 
-    for _, valueName in ipairs({ "OriginalName", "FruitName" }) do
+    for _, valueName in ipairs({ "FruitName", "OriginalName" }) do
         local valueObject = item:FindFirstChild(valueName)
         if valueObject and valueObject:IsA("StringValue") then
             local resolved = NormalizeFruitDisplayName(valueObject.Value)
@@ -717,7 +721,7 @@ local function ResolveFruitDisplayName(item)
         end
     end
 
-    return nil
+    return NormalizeFruitDisplayName(item.Name)
 end
 
 local function SnapshotOwnedFruitTools()
@@ -759,6 +763,8 @@ local function WaitForNewOwnedFruit(snapshot, timeout)
 end
 
 local worldFruitPickupInProgress = false
+local randomPurchaseInProgress = false
+local storeInProgress = false
 
 local function FindMeleeIn(container)
     if not container then return nil end
@@ -1522,8 +1528,12 @@ local function PickupFruit(fruit)
     local dist = (hrp.Position - handle.Position).Magnitude
 
     if dist <= CFG.PickupDist then
-        local fruitSnapshot = SnapshotOwnedFruitTools()
+        -- Không cho Tool đang random/lưu bị nhận nhầm là Fruit vừa nhặt ngoài map.
+        if randomPurchaseInProgress or storeInProgress then
+            return false, "Fruit đang được xử lý"
+        end
         worldFruitPickupInProgress = true
+        local fruitSnapshot = SnapshotOwnedFruitTools()
 
         -- Đủ gần → nhảy để trigger pickup (theo gốc dùng VirtualInputManager Space)
         local inputOk, inputError = pcall(function()
@@ -1541,14 +1551,13 @@ local function PickupFruit(fruit)
 
         local newOwnedFruit = WaitForNewOwnedFruit(fruitSnapshot, 2)
         worldFruitPickupInProgress = false
-        local char = GetChar()
-        local backpack = lp:FindFirstChild("Backpack")
+        -- Object ngoài map biến mất có thể do người khác nhặt/despawn.
+        -- Chỉ xác nhận khi chính inventory của người chơi có Tool Fruit mới.
         local picked = newOwnedFruit ~= nil
-            or not fruit.Parent
-            or (char and fruit:IsDescendantOf(char))
-            or (backpack and fruit:IsDescendantOf(backpack))
-        local pickedFruitName = ResolveFruitDisplayName(newOwnedFruit)
-            or ResolveFruitDisplayName(fruit)
+        -- Script gốc (deobfuscated.lua dòng 12460) dùng item.Name trực tiếp.
+        -- Dùng item.Name thay vì ResolveFruitDisplayName để giữ đúng tên
+        -- skin/variant (ví dụ: "Dragon East Fruit" thay vì "Dragon Fruit").
+        local pickedFruitName = picked and tostring(newOwnedFruit.Name) or nil
         Log(picked and "Pickup fruit thành công" or "Đã bấm Space nhưng chưa nhặt được fruit")
         return picked, picked and "Picked" or "Chưa nhặt được", pickedFruitName
     else
@@ -1630,8 +1639,6 @@ end
 -- Source gốc dùng: CommF_:InvokeServer("StoreFruit", originalName, tool)
 -- ─────────────────────────────────────────────
 local lastStoreTime = 0
-local storeInProgress = false
-
 local function IsInPlayerInventory(item)
     if not item or not item.Parent then return false end
     local char = GetChar()
@@ -1685,7 +1692,11 @@ local function StoreFruitInBackpack(bypassCooldown)
             local checkOk, isFruit = pcall(IsFruitTool, item)
             if checkOk and isFruit then
                 local metadataOk, itemName, storageName = pcall(function()
-                    return item.Name, GetFruitStorageName(item)
+                    local resolvedStorageName = GetFruitStorageName(item)
+                    -- Script gốc (deobfuscated.lua dòng 12460) dùng item.Name
+                    -- cho webhook. Không normalize để giữ đúng tên skin/variant
+                    -- (ví dụ: "Dragon East Fruit" thay vì "Dragon Fruit").
+                    return tostring(item.Name), resolvedStorageName
                 end)
                 if not metadataOk then
                     Log("Đọc metadata Fruit lỗi: " .. tostring(itemName))
@@ -1761,8 +1772,6 @@ end
 -- Không teleport và không phụ thuộc NPC/Spinner GUI.
 -- ─────────────────────────────────────────────
 local bannerClient = nil
-local randomPurchaseInProgress = false
-
 local function GetCommF()
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
     return remotes and remotes:FindFirstChild("CommF_") or nil
@@ -1851,8 +1860,12 @@ local function RandomFruit()
         return false, "Cooldown", isReady
     end
 
-    local fruitSnapshot = SnapshotOwnedFruitTools()
+    if worldFruitPickupInProgress or storeInProgress then
+        return false, "Busy", "Đang nhặt/lưu Fruit"
+    end
+
     randomPurchaseInProgress = true
+    local fruitSnapshot = SnapshotOwnedFruitTools()
 
     local transactionOk, outcome = xpcall(function()
         local result = commF:InvokeServer("Cousin", boxName)
@@ -1884,7 +1897,8 @@ local function RandomFruit()
         return {
             status = "Bought",
             fruit = newFruit,
-            fruitName = newFruit.Name,
+            -- Dùng item.Name trực tiếp để giữ đúng tên skin/variant cho webhook.
+            fruitName = tostring(newFruit.Name),
             detail = result,
         }
     end, function(err)
@@ -1900,8 +1914,12 @@ local function RandomFruit()
         return false, outcome.status, outcome.detail
     end
 
-    Log("Remote Random Fruit xác nhận nhận được: " .. outcome.fruitName)
-    SendFruitWebhook("Random", outcome.fruitName)
+    if outcome.fruitName then
+        Log("Remote Random Fruit xác nhận nhận được: " .. outcome.fruitName)
+        SendFruitWebhook("Random", outcome.fruitName)
+    else
+        Log("Bỏ qua webhook Random vì không xác định được tên Fruit")
+    end
     StoreFruitInBackpack(true)
     return true, "Bought", outcome.fruitName
 end
@@ -2324,7 +2342,6 @@ task.spawn(function()
                 local picked, pickupStatus, pickedFruitName = PickupFruit(fruit)
                 if picked then
                     local confirmedName = pickedFruitName
-                        or ResolveFruitDisplayName(fruit)
                     if confirmedName then
                         lblFruit.Text = "✅ Đã nhặt: " .. confirmedName
                         SendFruitWebhook("Picked", confirmedName)
