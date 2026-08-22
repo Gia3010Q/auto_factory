@@ -2119,10 +2119,14 @@ uiScale.Parent = frame
 local function UpdateGuiScale()
     local camera = workspace.CurrentCamera
     local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+    -- Roblox mobile dùng GUI pixel theo DPI nên panel 420x346 bị hiển thị lớn
+    -- hơn nhiều so với ảnh thiết kế. Giữ canvas gốc để không vỡ layout và
+    -- thu toàn bộ panel bằng UIScale theo loại thiết bị.
+    local preferredScale = UserInputService.TouchEnabled and 0.62 or 0.82
     uiScale.Scale = math.min(
-        1,
-        math.max((viewport.X - 20) / expandedSize.X.Offset, 0.65),
-        math.max((viewport.Y - 20) / expandedSize.Y.Offset, 0.65)
+        preferredScale,
+        math.max((viewport.X - 20) / expandedSize.X.Offset, 0.5),
+        math.max((viewport.Y - 20) / expandedSize.Y.Offset, 0.5)
     )
 end
 UpdateGuiScale()
@@ -2273,8 +2277,8 @@ end
 
 local lblBoss = MakeStatusRow(76, "⚙", "CORE", Color3.fromRGB(56, 215, 255))
 local lblFruit = MakeStatusRow(122, "◉", "FRUIT SCANNER", Color3.fromRGB(73, 230, 139))
-local lblRandom = MakeStatusRow(168, "⚄", "RANDOM FRUIT", Color3.fromRGB(197, 124, 255))
-local lblStore = MakeStatusRow(214, "◈", "STORAGE", Color3.fromRGB(255, 191, 60))
+local lblRandom = MakeStatusRow(168, "🎲", "RANDOM FRUIT", Color3.fromRGB(197, 124, 255))
+local lblStore = MakeStatusRow(214, "◆", "STORAGE", Color3.fromRGB(255, 191, 60))
 
 local footer = Instance.new("Frame")
 footer.Position = UDim2.fromOffset(0, 258)
