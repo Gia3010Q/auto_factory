@@ -694,11 +694,12 @@ end
 
 local function IsFruitTool(item)
     if not item or not item:IsA("Tool") then return false end
-    local itemName = string.lower(item.Name)
-    if string.find(itemName, "fruit", 1, true) == nil then return false end
-    -- Đảm bảo đây là vật phẩm Fruit nhặt được (có Handle part), tránh nhầm với kĩ năng trái đã ăn
     local handle = item:FindFirstChild("Handle")
-    return handle ~= nil and handle:IsA("BasePart")
+    if not handle or not handle:IsA("BasePart") then return false end
+    local itemName = string.lower(item.Name)
+    if string.find(itemName, "fruit", 1, true) ~= nil then return true end
+    if item:GetAttribute("OriginalName") or item:FindFirstChild("OriginalName") then return true end
+    return false
 end
 
 local function NormalizeFruitDisplayName(value)
@@ -1595,52 +1596,67 @@ local function TriggerFruitPickup(handle, hrp)
         return false, "Fruit/Character không còn sẵn sàng"
     end
 
-    -- Main loop có thể vào PickupDist trước Heartbeat cuối cùng. Phải
-    -- thả PlatformStand, BodyVelocity và noclip trước khi kích hoạt touch.
     CancelMove(true)
 
+    local char = GetChar()
     local humanoid = GetHumanoid()
-    if not humanoid or humanoid.Health <= 0 then
+    if not char or not humanoid or humanoid.Health <= 0 then
         return false, "Humanoid chưa sẵn sàng"
     end
 
+    -- 1. BẮT BUỘC Unequip toàn bộ vũ khí/Melee để tay trống nhặt Fruit
     pcall(function()
+        humanoid:UnequipTools()
         humanoid.Sit = false
         humanoid.PlatformStand = false
+    end)
 
-        -- Một số spawn bị chôn lệch trong terrain. Đặt root hơi phía
-        -- trên Handle để chân nhân vật cắt qua Fruit thay vì bị đẩy ngang.
-        local pickupHeight = math.max((handle.Size.Y * 0.5) + 1.5, 2.5)
-        hrp.CFrame = CFrame.new(
-            handle.Position + Vector3.new(0, pickupHeight, 0)
-        ) * hrp.CFrame.Rotation
+    -- 2. Đảm bảo CanTouch = true cho các bộ phận nhân vật
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            pcall(function()
+                part.CanTouch = true
+            end)
+        end
+    end
+
+    -- 3. Đưa RootPart áp sát trực tiếp vào CFrame của Handle
+    pcall(function()
+        hrp.CFrame = handle.CFrame
         StopRootVelocity(hrp)
     end)
 
-    -- Kích hoạt TouchInterest trực tiếp nếu executor hỗ trợ, không
-    -- phụ thuộc terrain hoặc nút nhảy trên mobile.
+    -- 4. Kích hoạt firetouchinterest cho RootPart và Chân (hỗ trợ cả R6/R15)
     pcall(function()
         if type(firetouchinterest) == "function" then
             firetouchinterest(hrp, handle, 0)
-            task.wait(0.05)
+            task.wait(0.03)
             firetouchinterest(hrp, handle, 1)
+
+            local rightFoot = char:FindFirstChild("RightFoot") or char:FindFirstChild("Right Leg")
+            if rightFoot then
+                firetouchinterest(rightFoot, handle, 0)
+                task.wait(0.02)
+                firetouchinterest(rightFoot, handle, 1)
+            end
+
+            local leftFoot = char:FindFirstChild("LeftFoot") or char:FindFirstChild("Left Leg")
+            if leftFoot then
+                firetouchinterest(leftFoot, handle, 0)
+                task.wait(0.02)
+                firetouchinterest(leftFoot, handle, 1)
+            end
         end
     end)
 
-    -- Fallback cho executor không hỗ trợ firetouchinterest.
-    local inputOk, inputError = pcall(function()
+    -- 5. Fallback kích hoạt Jump State
+    pcall(function()
         humanoid.Jump = true
         humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
         VIM:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-        task.wait(0.05)
+        task.wait(0.04)
         VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
     end)
-    if not inputOk then
-        pcall(function()
-            VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-        end)
-        return false, "Kích hoạt nhặt Fruit lỗi: " .. tostring(inputError)
-    end
 
     return true
 end
@@ -1655,8 +1671,9 @@ local function PickupFruit(fruit)
     if not hrp then return false, "Character chưa sẵn sàng" end
 
     local dist = (hrp.Position - handle.Position).Magnitude
+    local pickupThreshold = math.max(tonumber(CFG.PickupDist) or 6, 6)
 
-    if dist <= CFG.PickupDist then
+    if dist <= pickupThreshold then
         -- Không cho Tool đang random/lưu bị nhận nhầm là Fruit vừa nhặt ngoài map.
         if randomPurchaseInProgress or storeInProgress then
             return false, "Fruit đang được xử lý"
@@ -1670,16 +1687,12 @@ local function PickupFruit(fruit)
             return false, triggerError
         end
 
-        local newOwnedFruit = WaitForNewOwnedFruit(fruitSnapshot, 2)
-        -- Object ngoài map biến mất có thể do người khác nhặt/despawn.
-        -- Chỉ xác nhận khi chính inventory của người chơi có Tool Fruit mới.
+        local newOwnedFruit = WaitForNewOwnedFruit(fruitSnapshot, 1.5)
         local picked = newOwnedFruit ~= nil
-        -- Chờ ngắn nếu Tool mới chỉ mang tên chung "Fruit"; ưu tiên tên hiển
-        -- thị trực tiếp để không lặp lại lỗi lấy nhầm khóa Storage làm tên trái.
         local pickedFruitName = picked
             and WaitForResolvedFruitDisplayName(newOwnedFruit, 0.8) or nil
         worldFruitPickupInProgress = false
-        Log(picked and "Pickup fruit thành công" or "Đã bấm Space nhưng chưa nhặt được fruit")
+        Log(picked and "Pickup fruit thành công" or "Đã chạm fruit nhưng chưa vào inventory")
         return picked, picked and "Picked" or "Chưa nhặt được", pickedFruitName
     else
         -- Source gốc gọi toTarget(fruit.Handle.CFrame, true).
@@ -2233,7 +2246,7 @@ MakeText(
     Enum.TextXAlignment.Right
 )
 
-local function MakeStatusRow(y, icon, labelText, accentColor)
+local function MakeStatusRow(y, icon, labelText, accentColor, labelWidth)
     local row = Instance.new("Frame")
     row.Position = UDim2.fromOffset(10, y)
     row.Size = UDim2.new(1, -20, 0, 40)
@@ -2254,13 +2267,14 @@ local function MakeStatusRow(y, icon, labelText, accentColor)
         icon, accentColor, Enum.Font.GothamBold, 20, Enum.TextXAlignment.Center
     )
 
+    local lw = tonumber(labelWidth) or 110
     MakeText(
-        row, "Label", UDim2.fromOffset(54, 0), UDim2.fromOffset(135, 40),
-        labelText, Color3.fromRGB(238, 241, 246), Enum.Font.GothamBold, 13
+        row, "Label", UDim2.fromOffset(50, 0), UDim2.fromOffset(lw, 40),
+        labelText, Color3.fromRGB(238, 241, 246), Enum.Font.GothamBold, 12
     )
     local value = MakeText(
-        row, "Value", UDim2.fromOffset(190, 0), UDim2.new(1, -204, 1, 0),
-        "", accentColor, Enum.Font.GothamBold, 12, Enum.TextXAlignment.Right
+        row, "Value", UDim2.fromOffset(50 + lw + 4, 0), UDim2.new(1, -(50 + lw + 14), 1, 0),
+        "", accentColor, Enum.Font.GothamBold, 11.5, Enum.TextXAlignment.Right
     )
 
     local accent = Instance.new("Frame")
@@ -2273,10 +2287,10 @@ local function MakeStatusRow(y, icon, labelText, accentColor)
     return value
 end
 
-local lblBoss = MakeStatusRow(76, "⚙", "CORE", Color3.fromRGB(56, 215, 255))
-local lblFruit = MakeStatusRow(122, "◉", "FRUIT SCANNER", Color3.fromRGB(73, 230, 139))
-local lblRandom = MakeStatusRow(168, "🎲", "RANDOM FRUIT", Color3.fromRGB(197, 124, 255))
-local lblStore = MakeStatusRow(214, "◆", "STORAGE", Color3.fromRGB(255, 191, 60))
+local lblBoss = MakeStatusRow(76, "⚙", "CORE", Color3.fromRGB(56, 215, 255), 55)
+local lblFruit = MakeStatusRow(122, "◉", "FRUIT SCANNER", Color3.fromRGB(73, 230, 139), 105)
+local lblRandom = MakeStatusRow(168, "🎲", "RANDOM FRUIT", Color3.fromRGB(197, 124, 255), 98)
+local lblStore = MakeStatusRow(214, "◆", "STORAGE", Color3.fromRGB(255, 191, 60), 65)
 
 local footer = Instance.new("Frame")
 footer.Position = UDim2.fromOffset(0, 258)
@@ -2750,6 +2764,10 @@ task.spawn(function()
                     lblFruit.Text = "Tiếp cận: " .. fruitName
                 else
                     lblFruit.Text = tostring(pickupStatus or "Không nhặt được Fruit")
+                end
+
+                if pickupStatus == "Chưa nhặt được" then
+                    task.wait(0.25)
                 end
 
                 -- Lặp ngay để phát hiện Core vừa spawn và chuyển sang combat.
