@@ -10,6 +10,7 @@
     ✅ Dùng Entrance Mansion khi ở xa để tới Factory nhanh hơn
     ✅ Tự bật Buso Haki khi chạy script và sau khi respawn
     ✅ Auto tìm Fruit rơi trong map
+    ✅ Fruit ESP hiện tên, khoảng cách và Highlight xuyên vật thể
     ✅ Auto tele đến Fruit và nhặt
     ✅ Sau khi nhặt Fruit tự về Café, dùng Entrance Mansion nếu ở xa
     ✅ Auto Random Devil Fruit từ xa qua Cousin remote
@@ -30,7 +31,12 @@
 repeat task.wait() until game:IsLoaded()
 
 local startupEnv = getgenv()
-local startupPlayer = game:GetService("Players").LocalPlayer
+local startupPlayers = game:GetService("Players")
+local startupPlayer = startupPlayers.LocalPlayer
+while not startupPlayer do
+    task.wait()
+    startupPlayer = startupPlayers.LocalPlayer
+end
 local currentTeam = startupPlayer and startupPlayer.Team
 local currentTeamName = currentTeam and currentTeam.Name or nil
 
@@ -103,6 +109,13 @@ local CFG = {
     FruitEnabled  = true,   -- Bật/tắt tính năng tìm fruit
     FruitRange    = 0,      -- <= 0: không giới hạn, quét mọi Fruit trong cùng Sea
     PickupDist    = 5,       -- Khoảng cách nhặt (phải đứng gần bao nhiêu)
+    FruitESPEnabled = true, -- Hiện tên, khoảng cách và Highlight cho Fruit ngoài map
+    FruitESPShowDistance = true,
+    FruitESPShowHighlight = true,
+    FruitESPMaxDistance = 0, -- <= 0: ESP không giới hạn khoảng cách
+    FruitESPUpdateInterval = 0.1,
+    FruitESPScanInterval = 1,
+    FruitESPTextSize = 16,
     ReturnToCafeAfterPickup = true, -- Nhặt Fruit ngoài map xong tự về Café
     CafePosition = Vector3.new(-382, 74, 356), -- Tọa độ Café Sea 2 từ teleport_islands.lua
     CafeArrivalDistance = 10, -- Bán kính xác nhận đã về tới Café
@@ -187,6 +200,15 @@ if type(globalEnv.AutoFactoryMoveCleanup) == "function" then
     pcall(globalEnv.AutoFactoryMoveCleanup)
     globalEnv.AutoFactoryMoveCleanup = nil
 end
+if type(globalEnv.AutoFactoryESPCleanup) == "function" then
+    pcall(globalEnv.AutoFactoryESPCleanup)
+    globalEnv.AutoFactoryESPCleanup = nil
+end
+-- Nếu bản ESP standalone đang chạy thì dừng để không tạo hai nhãn cho cùng Fruit.
+if type(globalEnv.FruitESPController) == "table"
+    and type(globalEnv.FruitESPController.Stop) == "function" then
+    pcall(function() globalEnv.FruitESPController:Stop() end)
+end
 if type(globalEnv.AutoFactoryConnections) == "table" then
     for _, connection in ipairs(globalEnv.AutoFactoryConnections) do
         pcall(function() connection:Disconnect() end)
@@ -204,6 +226,10 @@ local runToken = {}
 globalEnv.AutoFactoryConnections = connections
 globalEnv.AutoFactoryRunToken = runToken -- chạy lại script sẽ dừng loop cũ
 globalEnv.AutoFactory = true
+
+local function IsAutoFactoryRunActive()
+    return globalEnv.AutoFactory and globalEnv.AutoFactoryRunToken == runToken
+end
 
 -- ─────────────────────────────────────────────
 -- UTILS
@@ -697,9 +723,9 @@ local function IsFruitTool(item)
     local handle = item:FindFirstChild("Handle")
     if not handle or not handle:IsA("BasePart") then return false end
     local itemName = string.lower(item.Name)
-    if string.find(itemName, "fruit", 1, true) ~= nil then return true end
-    if item:GetAttribute("OriginalName") or item:FindFirstChild("OriginalName") then return true end
-    return false
+    -- Không dùng riêng OriginalName để nhận diện: Sword/Gun cũng có thể mang
+    -- attribute này và sẽ bị nhầm thành Fruit khi snapshot hoặc Auto Store.
+    return string.find(itemName, "fruit", 1, true) ~= nil
 end
 
 local function NormalizeFruitDisplayName(value)
@@ -1146,6 +1172,11 @@ local function TryMansionEntrance(targetPosition, enabled, minDistanceValue, des
     local requestOk, requestError = pcall(function()
         commF:InvokeServer("requestEntrance", entrance)
     end)
+    if not IsAutoFactoryRunActive() then
+        -- Phiên mới đã tự cleanup state cũ; trả true để vòng cũ không khởi
+        -- động thêm một ToTarget trước khi thoát ở lần kiểm tra kế tiếp.
+        return true, "RunReplaced"
+    end
     if not requestOk then
         RestoreMoveCharacter()
         Log("Mansion Entrance lỗi: " .. tostring(requestError))
@@ -1153,6 +1184,7 @@ local function TryMansionEntrance(targetPosition, enabled, minDistanceValue, des
     end
 
     task.wait(0.2)
+    if not IsAutoFactoryRunActive() then return true, "RunReplaced" end
     local newRoot = GetHRP()
     local moved = newRoot
         and (newRoot.Position - oldPosition).Magnitude > 100
@@ -1230,9 +1262,11 @@ local function LeaveSeat(hrp, humanoid)
         task.wait()
         VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
     end)
+    if not IsAutoFactoryRunActive() then return end
     humanoid.Sit = false
     humanoid.Jump = true
     task.wait(0.1)
+    if not IsAutoFactoryRunActive() then return end
     if hrp.Parent then hrp.CFrame = hrp.CFrame * CFrame.new(0, 10, 0) end
 end
 
@@ -1568,6 +1602,7 @@ local function FindFruitInWorld()
 
         local handle = obj:FindFirstChild("Handle")
         if not handle or not handle:IsA("BasePart") then return end
+        if obj:FindFirstChild("Ignored") or handle:FindFirstChild("Ignored") then return end
 
         local dist = (hrp.Position - handle.Position).Magnitude
         if dist <= bestDist then
@@ -1648,6 +1683,9 @@ local function TriggerFruitPickup(handle, hrp)
             end
         end
     end)
+    if not IsAutoFactoryRunActive() then
+        return false, "RunReplaced"
+    end
 
     -- 5. Fallback kích hoạt Jump State
     pcall(function()
@@ -1657,6 +1695,10 @@ local function TriggerFruitPickup(handle, hrp)
         task.wait(0.04)
         VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
     end)
+
+    if not IsAutoFactoryRunActive() then
+        return false, "RunReplaced"
+    end
 
     return true
 end
@@ -1678,8 +1720,8 @@ local function PickupFruit(fruit)
         if randomPurchaseInProgress or storeInProgress then
             return false, "Fruit đang được xử lý"
         end
-        worldFruitPickupInProgress = true
         local fruitSnapshot = SnapshotOwnedFruitTools()
+        worldFruitPickupInProgress = true
 
         local triggered, triggerError = TriggerFruitPickup(handle, hrp)
         if not triggered then
@@ -1795,6 +1837,10 @@ local function GetFruitStorageName(item)
 end
 
 local function StoreFruitInBackpack(bypassCooldown)
+    if not IsAutoFactoryRunActive() then
+        return 0, 0, 0, "stopped", 0
+    end
+
     -- Chặn các lượt quét chồng nhau để không gửi StoreFruit hai lần cho cùng Tool.
     if storeInProgress then
         return 0, 0, 0, "busy", 0
@@ -1826,6 +1872,7 @@ local function StoreFruitInBackpack(bypassCooldown)
     local function storeFrom(container)
         if not container then return end
         for _, item in ipairs(container:GetChildren()) do
+            if not IsAutoFactoryRunActive() then return "stopped" end
             local checkOk, isFruit = pcall(IsFruitTool, item)
             if checkOk and isFruit then
                 local metadataOk, itemName, storageName = pcall(function()
@@ -1858,6 +1905,7 @@ local function StoreFruitInBackpack(bypassCooldown)
                 local ok, result = pcall(function()
                     return commF:InvokeServer("StoreFruit", storageName, item)
                 end)
+                if not IsAutoFactoryRunActive() then return "stopped" end
 
                 -- Cho game một khoảng ngắn để chuyển Tool ra khỏi Backpack.
                 for _ = 1, 5 do
@@ -1887,8 +1935,8 @@ local function StoreFruitInBackpack(bypassCooldown)
     end
 
     local runOk, runError = xpcall(function()
-        storeFrom(bp)
-        if char then storeFrom(char) end
+        local backpackStatus = storeFrom(bp)
+        if backpackStatus ~= "stopped" and char then storeFrom(char) end
     end, function(err)
         return tostring(err)
     end)
@@ -1973,6 +2021,7 @@ local function ClassifyRandomFruitResponse(value)
 end
 
 local function RandomFruit()
+    if not IsAutoFactoryRunActive() then return false, "Stopped" end
     local commF = GetCommF()
     if not commF then return false, "RemoteError", "Không tìm thấy CommF_" end
 
@@ -1986,6 +2035,7 @@ local function RandomFruit()
             "Cousin", "Check", boxName
         )
     end)
+    if not IsAutoFactoryRunActive() then return false, "Stopped" end
 
     if playerLevel and playerLevel < 50 then
         return false, "Low Level", playerLevel
@@ -1994,6 +2044,7 @@ local function RandomFruit()
     local timeOk, isReady = pcall(function()
         return commF:InvokeServer("Cousin", "CheckTime", boxName)
     end)
+    if not IsAutoFactoryRunActive() then return false, "Stopped" end
     if not timeOk then
         return false, "RemoteError", tostring(isReady)
     end
@@ -2005,11 +2056,14 @@ local function RandomFruit()
         return false, "Busy", "Đang nhặt/lưu Fruit"
     end
 
-    randomPurchaseInProgress = true
     local fruitSnapshot = SnapshotOwnedFruitTools()
+    randomPurchaseInProgress = true
 
     local transactionOk, outcome = xpcall(function()
         local result = commF:InvokeServer("Cousin", boxName)
+        if not IsAutoFactoryRunActive() then
+            return { status = "Stopped" }
+        end
         local responseStatus = ClassifyRandomFruitResponse(result)
 
         if responseStatus == "Cooldown" then
@@ -2021,6 +2075,9 @@ local function RandomFruit()
         -- Fallback cũ dành cho server/executor không nhận boxName.
         if result == nil or result == false then
             result = commF:InvokeServer("Cousin")
+            if not IsAutoFactoryRunActive() then
+                return { status = "Stopped" }
+            end
             responseStatus = ClassifyRandomFruitResponse(result)
             if responseStatus == "Cooldown" then
                 return { status = "Cooldown", detail = result }
@@ -2053,6 +2110,7 @@ local function RandomFruit()
     if outcome.status ~= "Bought" then
         return false, outcome.status, outcome.detail
     end
+    if not IsAutoFactoryRunActive() then return false, "Stopped" end
 
     if outcome.fruitName then
         Log("Remote Random Fruit xác nhận nhận được: " .. outcome.fruitName)
@@ -2065,12 +2123,325 @@ local function RandomFruit()
 end
 
 -- ─────────────────────────────────────────────
+-- FRUIT ESP (tích hợp từ esp_fruit.lua)
+-- Quét Fruit là child trực tiếp của Workspace, nhận diện thêm Model bằng MeshId.
+-- ─────────────────────────────────────────────
+local FRUIT_ESP_UI_NAME = "__AutoFactoryFruitESP"
+local FRUIT_ESP_HIGHLIGHT_NAME = "__AutoFactoryFruitESPHighlight"
+local FRUIT_ESP_NAMES_BY_MESH = {
+    ["15100283484"] = "Light Fruit",
+    ["15116730102"] = "Love Fruit",
+    ["15100273645"] = "Dough Fruit",
+    ["15116967784"] = "Spider Fruit",
+    ["15112263502"] = "Shadow Fruit",
+    ["15104782377"] = "Blade Fruit",
+    ["15060012861"] = "Rocket Fruit",
+    ["15106768588"] = "Leopard Fruit",
+    ["15112469964"] = "Falcon Fruit",
+    ["15708895165"] = "T-Rex Fruit",
+    ["19001642259"] = "Dragon East Fruit",
+    ["86024571204851"] = "Gas Fruit",
+    ["15100246632"] = "Phoenix Fruit",
+    ["14661873358"] = "Sound Fruit",
+    ["15111584216"] = "Flame Fruit",
+    ["15105281957"] = "Spring Fruit",
+    ["15116740364"] = "Bomb Fruit",
+    ["15104817760"] = "Rubber Fruit",
+    ["15057683975"] = "Spin Fruit",
+    ["15105350415"] = "Magma Fruit",
+    ["15482881956"] = "Kitsune Fruit",
+    ["15100485671"] = "Barrier Fruit",
+    ["18955022385"] = "Dragon West Fruit",
+    ["101378450824208"] = "Yeti Fruit",
+    ["15116721173"] = "Pain Fruit",
+    ["10395893751"] = "Venom Fruit",
+    ["11908375285"] = "Spirit Fruit",
+    ["15100433167"] = "Ice Fruit",
+    ["15100299740"] = "Gravity Fruit",
+    ["15107005807"] = "Spike Fruit",
+    ["15116696973"] = "Smoke Fruit",
+    ["15112600534"] = "Diamond Fruit",
+    ["15112333093"] = "Ghost Fruit",
+    ["15057718441"] = "Quake Fruit",
+    ["15111517529"] = "Sand Fruit",
+    ["15100313696"] = "Buddha Fruit",
+    ["15116747420"] = "Rumble Fruit",
+    ["15100384816"] = "Blizzard Fruit",
+    ["15111553409"] = "Dark Fruit",
+    ["14661837634"] = "Mammoth Fruit",
+    ["15100184583"] = "Control Fruit",
+}
+local FRUIT_ESP_COLORS = {
+    ["Leopard Fruit"] = Color3.fromRGB(255, 170, 0),
+    ["Dragon East Fruit"] = Color3.fromRGB(255, 0, 0),
+    ["Dragon West Fruit"] = Color3.fromRGB(255, 80, 80),
+    ["Kitsune Fruit"] = Color3.fromRGB(200, 100, 255),
+    ["Spirit Fruit"] = Color3.fromRGB(120, 200, 255),
+    ["Venom Fruit"] = Color3.fromRGB(180, 60, 200),
+    ["Dough Fruit"] = Color3.fromRGB(255, 220, 180),
+    ["Light Fruit"] = Color3.fromRGB(255, 255, 150),
+}
+local FRUIT_ESP_DEFAULT_COLOR = Color3.fromRGB(255, 255, 255)
+local fruitESPRecords = setmetatable({}, { __mode = "k" })
+local fruitESPRoot = nil
+local fruitESPRunning = false
+
+local function NormalizeFruitESPAssetId(value)
+    return value ~= nil and string.match(tostring(value), "%d+") or nil
+end
+
+local function FindFruitESPAnchor(instance)
+    if not instance or not instance.Parent then return nil end
+    if instance:IsA("BasePart") then return instance end
+
+    local handle = instance:FindFirstChild("Handle")
+    if handle and handle:IsA("BasePart") then return handle end
+    if instance:IsA("Model") and instance.PrimaryPart then return instance.PrimaryPart end
+    return instance:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function FindFruitESPModelName(model)
+    for _, descendant in ipairs(model:GetDescendants()) do
+        local meshId, anchor
+        if descendant:IsA("MeshPart") then
+            meshId = descendant.MeshId
+            anchor = descendant
+        elseif descendant:IsA("SpecialMesh") then
+            meshId = descendant.MeshId
+            if descendant.Parent and descendant.Parent:IsA("BasePart") then
+                anchor = descendant.Parent
+            end
+        end
+
+        local fruitName = FRUIT_ESP_NAMES_BY_MESH[NormalizeFruitESPAssetId(meshId)]
+        if fruitName then
+            return fruitName, anchor or FindFruitESPAnchor(model)
+        end
+    end
+    return nil, nil
+end
+
+local function IdentifyFruitForESP(instance)
+    if not instance or instance.Parent ~= workspace then return nil, nil end
+
+    if instance:IsA("Tool") then
+        if not IsFruitTool(instance) then return nil, nil end
+        local handle = FindFruitESPAnchor(instance)
+        if not handle or handle:FindFirstChild("Ignored") then return nil, nil end
+        return ResolveFruitDisplayName(instance) or tostring(instance.Name), handle
+    end
+
+    if instance:IsA("Model") then
+        local fruitName, meshPart = FindFruitESPModelName(instance)
+        local anchor = meshPart or FindFruitESPAnchor(instance)
+        if not fruitName
+            and string.find(string.lower(instance.Name), "fruit", 1, true) then
+            fruitName = ResolveFruitDisplayName(instance) or tostring(instance.Name)
+        end
+        if not fruitName or not anchor then return nil, nil end
+        if instance:FindFirstChild("Ignored") or anchor:FindFirstChild("Ignored") then
+            return nil, nil
+        end
+        return fruitName, anchor
+    end
+
+    return nil, nil
+end
+
+local function RemoveFruitESPRecord(fruit)
+    local record = fruitESPRecords[fruit]
+    if not record then return end
+    if record.Billboard then pcall(function() record.Billboard:Destroy() end) end
+    if record.Highlight then pcall(function() record.Highlight:Destroy() end) end
+    fruitESPRecords[fruit] = nil
+end
+
+local function CreateFruitESPHighlight(record)
+    if not CFG.FruitESPShowHighlight or record.Highlight then return end
+
+    local oldHighlight = record.Part:FindFirstChild(FRUIT_ESP_HIGHLIGHT_NAME)
+    if oldHighlight then pcall(function() oldHighlight:Destroy() end) end
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = FRUIT_ESP_HIGHLIGHT_NAME
+    highlight.Adornee = record.Fruit:IsA("Model") and record.Fruit or record.Part
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.FillColor = record.Color
+    highlight.FillTransparency = 0.82
+    highlight.OutlineColor = record.Color
+    highlight.OutlineTransparency = 0
+    highlight.Parent = record.Part
+    record.Highlight = highlight
+end
+
+local function AddFruitESPRecord(fruit)
+    if not fruitESPRunning or fruitESPRecords[fruit] then return false end
+    local fruitName, part = IdentifyFruitForESP(fruit)
+    if not fruitName or not part or not fruitESPRoot then return false end
+
+    local color = FRUIT_ESP_COLORS[fruitName] or FRUIT_ESP_DEFAULT_COLOR
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "FruitESP"
+    billboard.Adornee = part
+    billboard.AlwaysOnTop = true
+    billboard.LightInfluence = 0
+    billboard.Size = UDim2.fromOffset(220, 36)
+    billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+    billboard.Parent = fruitESPRoot
+
+    local background = Instance.new("Frame")
+    background.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    background.BackgroundTransparency = 0.4
+    background.BorderSizePixel = 0
+    background.Size = UDim2.fromScale(1, 1)
+    background.Parent = billboard
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 5)
+    corner.Parent = background
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.SourceSansBold
+    label.Size = UDim2.fromScale(1, 1)
+    label.Text = fruitName
+    label.TextColor3 = color
+    label.TextSize = math.max(10, tonumber(CFG.FruitESPTextSize) or 16)
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    label.TextStrokeTransparency = 0
+    label.Parent = background
+
+    local record = {
+        Fruit = fruit,
+        Part = part,
+        Name = fruitName,
+        Color = color,
+        Billboard = billboard,
+        Label = label,
+        Highlight = nil,
+    }
+    fruitESPRecords[fruit] = record
+    CreateFruitESPHighlight(record)
+    return true
+end
+
+local function UpdateFruitESPRecord(record, root)
+    local fruit = record.Fruit
+    if not fruit or fruit.Parent ~= workspace then return false end
+
+    local currentName, currentPart = IdentifyFruitForESP(fruit)
+    if not currentName or not currentPart then return false end
+    if currentPart ~= record.Part then
+        record.Part = currentPart
+        record.Billboard.Adornee = currentPart
+        if record.Highlight then record.Highlight:Destroy() end
+        record.Highlight = nil
+    end
+    if currentName ~= record.Name then
+        record.Name = currentName
+        record.Color = FRUIT_ESP_COLORS[currentName] or FRUIT_ESP_DEFAULT_COLOR
+        record.Label.TextColor3 = record.Color
+        if record.Highlight then
+            record.Highlight.FillColor = record.Color
+            record.Highlight.OutlineColor = record.Color
+        end
+    end
+
+    local distance = root and (root.Position - record.Part.Position).Magnitude or math.huge
+    local maxDistance = math.max(tonumber(CFG.FruitESPMaxDistance) or 0, 0)
+    local visible = root ~= nil and (maxDistance <= 0 or distance <= maxDistance)
+    record.Billboard.Enabled = visible
+    if record.Highlight then
+        record.Highlight.Enabled = visible and CFG.FruitESPShowHighlight
+    elseif visible then
+        CreateFruitESPHighlight(record)
+    end
+    if visible then
+        record.Label.Text = CFG.FruitESPShowDistance
+            and string.format("%s [%dm]", record.Name, math.floor(distance + 0.5))
+            or record.Name
+    end
+    return true
+end
+
+local function RefreshFruitESP()
+    if not fruitESPRunning then return end
+    for _, child in ipairs(workspace:GetChildren()) do AddFruitESPRecord(child) end
+    for fruit in pairs(fruitESPRecords) do
+        if not fruit or fruit.Parent ~= workspace then RemoveFruitESPRecord(fruit) end
+    end
+end
+
+local function UpdateFruitESP()
+    local humanoid = GetHumanoid()
+    local root = humanoid and humanoid.Health > 0 and GetHRP() or nil
+    for fruit, record in pairs(fruitESPRecords) do
+        if not UpdateFruitESPRecord(record, root) then RemoveFruitESPRecord(fruit) end
+    end
+end
+
+local function CleanupFruitESP()
+    fruitESPRunning = false
+    local fruits = {}
+    for fruit in pairs(fruitESPRecords) do table.insert(fruits, fruit) end
+    for _, fruit in ipairs(fruits) do RemoveFruitESPRecord(fruit) end
+    if fruitESPRoot then pcall(function() fruitESPRoot:Destroy() end) end
+    fruitESPRoot = nil
+end
+globalEnv.AutoFactoryESPCleanup = CleanupFruitESP
+
+local function StartFruitESP(parentGui)
+    if not CFG.FruitESPEnabled or fruitESPRunning then return end
+    local oldRoot = parentGui:FindFirstChild(FRUIT_ESP_UI_NAME)
+    if oldRoot then oldRoot:Destroy() end
+
+    fruitESPRoot = Instance.new("ScreenGui")
+    fruitESPRoot.Name = FRUIT_ESP_UI_NAME
+    fruitESPRoot.DisplayOrder = 1000000
+    fruitESPRoot.IgnoreGuiInset = true
+    fruitESPRoot.ResetOnSpawn = false
+    fruitESPRoot.Parent = parentGui
+    fruitESPRunning = true
+
+    RefreshFruitESP()
+    UpdateFruitESP()
+
+    TrackConnection(workspace.ChildAdded, function(child)
+        task.defer(function()
+            if fruitESPRunning and IsAutoFactoryRunActive() then
+                AddFruitESPRecord(child)
+            end
+        end)
+    end)
+    TrackConnection(workspace.ChildRemoved, RemoveFruitESPRecord)
+
+    local updateElapsed, scanElapsed = 0, 0
+    TrackConnection(RunService.Heartbeat, function(dt)
+        if not fruitESPRunning or not IsAutoFactoryRunActive() then return end
+        updateElapsed = updateElapsed + dt
+        scanElapsed = scanElapsed + dt
+        if updateElapsed >= math.max(tonumber(CFG.FruitESPUpdateInterval) or 0.1, 0.03) then
+            updateElapsed = 0
+            UpdateFruitESP()
+        end
+        if scanElapsed >= math.max(tonumber(CFG.FruitESPScanInterval) or 1, 0.2) then
+            scanElapsed = 0
+            RefreshFruitESP()
+        end
+    end)
+end
+
+-- ─────────────────────────────────────────────
 -- GUI
 -- ─────────────────────────────────────────────
 -- Xóa GUI cũ
 local playerGui = lp:WaitForChild("PlayerGui")
 local oldGui = playerGui:FindFirstChild("AutoFactoryGUI")
 if oldGui then pcall(function() oldGui:Destroy() end) end
+local espOk, espError = pcall(StartFruitESP, playerGui)
+if not espOk then
+    CleanupFruitESP()
+    Log("Fruit ESP khởi động lỗi: " .. tostring(espError))
+end
 
 local sg = Instance.new("ScreenGui")
 sg.Name            = "AutoFactoryGUI"
@@ -2350,6 +2721,7 @@ TrackConnection(stopBtn.MouseLeave, function()
 end)
 TrackConnection(stopBtn.Activated, function()
     globalEnv.AutoFactory = false
+    CleanupFruitESP()
 end)
 
 -- Drag GUI bằng chuột lẫn touch (Delta/mobile).
@@ -2802,7 +3174,17 @@ task.spawn(function()
         globalEnv.AutoFactoryBusoEnabled = false
     end
 
-    CancelMove(true)
+    -- Khi rerun, phiên mới đã gọi moveCleanup của phiên cũ trước khi nhận
+    -- quyền điều khiển. Không cleanup lần hai ở đây vì nó có thể tắt noclip,
+    -- PlatformStand và lực bay mà phiên mới vừa tạo.
+    if globalEnv.AutoFactoryRunToken == runToken
+        or globalEnv.AutoFactoryMoveCleanup == moveCleanup then
+        CancelMove(true)
+    end
+    CleanupFruitESP()
+    if globalEnv.AutoFactoryESPCleanup == CleanupFruitESP then
+        globalEnv.AutoFactoryESPCleanup = nil
+    end
     if globalEnv.AutoFactoryMoveCleanup == moveCleanup then
         globalEnv.AutoFactoryMoveCleanup = nil
     end
