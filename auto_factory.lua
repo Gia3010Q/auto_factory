@@ -2119,14 +2119,10 @@ uiScale.Parent = frame
 local function UpdateGuiScale()
     local camera = workspace.CurrentCamera
     local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
-    -- Roblox mobile dùng GUI pixel theo DPI nên panel 420x346 bị hiển thị lớn
-    -- hơn nhiều so với ảnh thiết kế. Giữ canvas gốc để không vỡ layout và
-    -- thu toàn bộ panel bằng UIScale theo loại thiết bị.
-    local preferredScale = UserInputService.TouchEnabled and 0.62 or 0.82
     uiScale.Scale = math.min(
-        preferredScale,
-        math.max((viewport.X - 20) / expandedSize.X.Offset, 0.5),
-        math.max((viewport.Y - 20) / expandedSize.Y.Offset, 0.5)
+        1,
+        math.max((viewport.X - 20) / expandedSize.X.Offset, 0.65),
+        math.max((viewport.Y - 20) / expandedSize.Y.Offset, 0.65)
     )
 end
 UpdateGuiScale()
