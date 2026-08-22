@@ -11,6 +11,7 @@
     ✅ Tự bật Buso Haki khi chạy script và sau khi respawn
     ✅ Auto tìm Fruit rơi trong map
     ✅ Auto tele đến Fruit và nhặt
+    ✅ Sau khi nhặt Fruit tự về Café, dùng Entrance Mansion nếu ở xa
     ✅ Auto Random Devil Fruit từ xa qua Cousin remote
     ✅ Tự đóng SpinnerWindow và thông báo nhận Fruit
     ✅ Auto lưu Fruit vừa nhặt vào Storage
@@ -33,19 +34,17 @@ local startupPlayer = game:GetService("Players").LocalPlayer
 local currentTeam = startupPlayer and startupPlayer.Team
 local currentTeamName = currentTeam and currentTeam.Name or nil
 
--- Nếu người chơi đã tự chọn team thì giữ nguyên lựa chọn đó. Chỉ dùng Marines
--- làm mặc định khi cả cấu hình lẫn team hiện tại đều chưa hợp lệ.
-if startupEnv.MyTeam ~= "Pirates" and startupEnv.MyTeam ~= "Marines" then
-    if currentTeamName == "Pirates" or currentTeamName == "Marines" then
-        startupEnv.MyTeam = currentTeamName
-    else
-        startupEnv.MyTeam = "Marines"
-    end
-end
-
-if currentTeamName == startupEnv.MyTeam then
+-- Team hiện tại trong server luôn được ưu tiên. getgenv() tồn tại qua các lần
+-- chạy nên MyTeam cũ không được phép kéo người chơi sang team khác khi rerun.
+local hasSelectedTeam = currentTeamName == "Pirates" or currentTeamName == "Marines"
+if hasSelectedTeam then
+    startupEnv.MyTeam = currentTeamName
     print("[AutoFactory] Đã ở đúng team, bỏ qua SetTeam: " .. currentTeamName)
 else
+    if startupEnv.MyTeam ~= "Pirates" and startupEnv.MyTeam ~= "Marines" then
+        startupEnv.MyTeam = "Marines"
+    end
+
     local teamSetOk, teamSetError = pcall(function()
         local replicatedStorage = game:GetService("ReplicatedStorage")
         local remotes = replicatedStorage:WaitForChild("Remotes", 10)
@@ -103,6 +102,11 @@ local CFG = {
     FruitEnabled  = true,   -- Bật/tắt tính năng tìm fruit
     FruitRange    = 0,      -- <= 0: không giới hạn, quét mọi Fruit trong cùng Sea
     PickupDist    = 5,       -- Khoảng cách nhặt (phải đứng gần bao nhiêu)
+    ReturnToCafeAfterPickup = true, -- Nhặt Fruit ngoài map xong tự về Café
+    CafePosition = Vector3.new(-382, 74, 356), -- Tọa độ Café Sea 2 từ teleport_islands.lua
+    CafeArrivalDistance = 10, -- Bán kính xác nhận đã về tới Café
+    UseCafeEntrance = true, -- Ở xa thì requestEntrance Mansion rồi bay nốt về Café
+    CafeEntranceMinDistance = 800, -- Chỉ dùng Mansion khi cách Café ít nhất 800 studs
     AutoStore     = true,   -- Tự lưu Fruit vật phẩm đang giữ
     StoreCooldown = 3,      -- Khoảng nghỉ giữa các lần thử lưu (giây)
     StoreRetryDelay = 15,   -- Thử lại Fruit bị server từ chối/lỗi tạm thời
@@ -215,6 +219,15 @@ local function GetHttpRequest()
         or (fluxus and fluxus.request)
 end
 
+local function GetConfiguredWebhookURL()
+    local envUrl = tostring((globalEnv and globalEnv.WebhookURL) or "")
+        :gsub("^%s+", ""):gsub("%s+$", "")
+    if envUrl ~= "" then return envUrl end
+
+    return tostring(CFG.WebhookURL or "")
+        :gsub("^%s+", ""):gsub("%s+$", "")
+end
+
 -- ─────────────────────────────────────────────
 -- CƠ CHẾ ĐỌC RARITY TRỰC TIẾP TỪ GAME
 -- ─────────────────────────────────────────────
@@ -310,11 +323,7 @@ end
 
 local function SendFruitWebhook(eventType, fruitName)
     if not CFG.WebhookEnabled then return end
-    local webhookUrl = tostring(
-        (globalEnv and globalEnv.WebhookURL)
-        or CFG.WebhookURL
-        or ""
-    ):gsub("^%s+", ""):gsub("%s+$", "")
+    local webhookUrl = GetConfiguredWebhookURL()
 
     if webhookUrl == "" or not string.find(webhookUrl, "http", 1, true) then
         return
@@ -435,10 +444,21 @@ local function SendFruitWebhook(eventType, fruitName)
             })
         end)
 
-        if postOk then
+        local statusCode = type(response) == "table" and tonumber(
+            response.StatusCode or response.Status or response.status_code
+        ) or nil
+        local requestSucceeded = postOk
+            and (type(response) ~= "table" or response.Success ~= false)
+            and (statusCode == nil or (statusCode >= 200 and statusCode < 300))
+
+        if requestSucceeded then
             Log("Webhook [" .. eventType .. "] đã gửi thành công: " .. cleanFruitName)
         else
-            Log("Webhook [" .. eventType .. "] gửi thất bại: " .. tostring(response))
+            local responseDetail = response
+            if type(response) == "table" then
+                responseDetail = response.Body or response.Message or statusCode or "Unknown response"
+            end
+            Log("Webhook [" .. eventType .. "] gửi thất bại: " .. tostring(responseDetail))
         end
     end)
 end
@@ -700,28 +720,54 @@ local function NormalizeFruitDisplayName(value)
     return name
 end
 
-local function ResolveFruitDisplayName(item)
+local function GetFruitOriginalName(item)
     if not item then return nil end
 
-    -- Blox Fruits chỉ có attribute "OriginalName" (dạng "Magma-Magma").
-    -- "FruitName" không tồn tại trong game — đã bỏ để tránh match nhầm.
     local origOk, origValue = pcall(function()
         return item:GetAttribute("OriginalName")
     end)
-    if origOk then
-        local resolved = NormalizeFruitDisplayName(origValue)
-        if resolved then return resolved end
+    if origOk and type(origValue) == "string" and origValue ~= "" then
+        return origValue
     end
 
-    for _, valueName in ipairs({ "FruitName", "OriginalName" }) do
-        local valueObject = item:FindFirstChild(valueName)
-        if valueObject and valueObject:IsA("StringValue") then
-            local resolved = NormalizeFruitDisplayName(valueObject.Value)
-            if resolved then return resolved end
+    local originalNameValue = item:FindFirstChild("OriginalName")
+    if originalNameValue and originalNameValue:IsA("StringValue")
+        and originalNameValue.Value ~= "" then
+        return originalNameValue.Value
+    end
+
+    return nil
+end
+
+local function ResolveFruitDisplayName(item)
+    if not item then return nil end
+
+    -- Tool.Name là tên hiển thị thực tế mà bản cũ dùng đúng. OriginalName chỉ
+    -- là khóa Storage nên chỉ dùng làm fallback nếu Tool vẫn mang tên "Fruit".
+    local directName = NormalizeFruitDisplayName(item.Name)
+    if directName then return directName end
+
+    return NormalizeFruitDisplayName(GetFruitOriginalName(item))
+end
+
+local function WaitForResolvedFruitDisplayName(item, timeout)
+    local deadline = tick() + math.max(tonumber(timeout) or 0.8, 0)
+    local metadataFallback = nil
+    repeat
+        local directName = item and NormalizeFruitDisplayName(item.Name) or nil
+        if directName then return directName end
+        metadataFallback = item
+            and NormalizeFruitDisplayName(GetFruitOriginalName(item))
+            or metadataFallback
+        if not item or not item.Parent
+            or not globalEnv.AutoFactory
+            or globalEnv.AutoFactoryRunToken ~= runToken then
+            break
         end
-    end
+        task.wait(0.05)
+    until tick() >= deadline
 
-    return NormalizeFruitDisplayName(item.Name)
+    return metadataFallback
 end
 
 local function SnapshotOwnedFruitTools()
@@ -765,6 +811,14 @@ end
 local worldFruitPickupInProgress = false
 local randomPurchaseInProgress = false
 local storeInProgress = false
+local cafeReturnPending = false
+local cafeReturnFruitName = nil
+
+local function QueueCafeReturn(fruitName)
+    if not CFG.ReturnToCafeAfterPickup then return end
+    cafeReturnPending = true
+    cafeReturnFruitName = type(fruitName) == "string" and fruitName or nil
+end
 
 local function FindMeleeIn(container)
     if not container then return nil end
@@ -1047,10 +1101,10 @@ local function CancelMove(restoreCharacter)
     if restoreCharacter then RestoreMoveCharacter() end
 end
 
--- Khi Core xuất hiện ở quá xa, dùng requestEntrance tới Mansion rồi tiếp tục
--- bay bằng ToTarget hiện tại. Remote lỗi/không dịch chuyển sẽ tự fallback bay.
-local function TryFactoryEntrance(targetPosition)
-    if not CFG.UseFactoryEntrance or typeof(targetPosition) ~= "Vector3" then
+-- Dùng requestEntrance tới Mansion rồi tiếp tục bay bằng ToTarget.
+-- Factory và Café dùng chung route/cooldown để không spam CommF_.
+local function TryMansionEntrance(targetPosition, enabled, minDistanceValue, destinationName)
+    if not enabled or typeof(targetPosition) ~= "Vector3" then
         return false, "EntranceDisabled"
     end
 
@@ -1061,7 +1115,7 @@ local function TryFactoryEntrance(targetPosition)
     end
 
     local minDistance = math.max(
-        tonumber(CFG.FactoryEntranceMinDistance) or 3000,
+        tonumber(minDistanceValue) or 0,
         0
     )
     local directDistance = (hrp.Position - targetPosition).Magnitude
@@ -1092,7 +1146,7 @@ local function TryFactoryEntrance(targetPosition)
     end)
     if not requestOk then
         RestoreMoveCharacter()
-        Log("Factory Entrance lỗi: " .. tostring(requestError))
+        Log("Mansion Entrance lỗi: " .. tostring(requestError))
         return false, "EntranceRemoteError"
     end
 
@@ -1104,10 +1158,29 @@ local function TryFactoryEntrance(targetPosition)
     RestoreMoveCharacter()
 
     if moved then
-        Log("Đã dùng Entrance Mansion để tới gần Factory")
+        Log("Đã dùng Entrance Mansion để tới gần "
+            .. tostring(destinationName or "mục tiêu"))
         return true, "EntranceMansion"
     end
     return false, "EntranceRejected"
+end
+
+local function TryFactoryEntrance(targetPosition)
+    return TryMansionEntrance(
+        targetPosition,
+        CFG.UseFactoryEntrance,
+        CFG.FactoryEntranceMinDistance,
+        "Factory"
+    )
+end
+
+local function TryCafeEntrance(targetPosition)
+    return TryMansionEntrance(
+        targetPosition,
+        CFG.UseCafeEntrance,
+        CFG.CafeEntranceMinDistance,
+        "Café"
+    )
 end
 
 -- Giữ nhân vật ổn định khi đã vào tầm Core. BodyVelocity triệt vận tốc/rơi;
@@ -1516,6 +1589,61 @@ end
 --   - Nếu đã gần fruit (<=5 studs) → nhảy Space (trigger touch pickup)
 --   - Nếu còn xa → tele đến Handle.CFrame bằng cơ chế Heartbeat
 -- ─────────────────────────────────────────────
+local function TriggerFruitPickup(handle, hrp)
+    if not handle or not handle.Parent or not hrp or not hrp.Parent then
+        return false, "Fruit/Character không còn sẵn sàng"
+    end
+
+    -- Main loop có thể vào PickupDist trước Heartbeat cuối cùng. Phải
+    -- thả PlatformStand, BodyVelocity và noclip trước khi kích hoạt touch.
+    CancelMove(true)
+
+    local humanoid = GetHumanoid()
+    if not humanoid or humanoid.Health <= 0 then
+        return false, "Humanoid chưa sẵn sàng"
+    end
+
+    pcall(function()
+        humanoid.Sit = false
+        humanoid.PlatformStand = false
+
+        -- Một số spawn bị chôn lệch trong terrain. Đặt root hơi phía
+        -- trên Handle để chân nhân vật cắt qua Fruit thay vì bị đẩy ngang.
+        local pickupHeight = math.max((handle.Size.Y * 0.5) + 1.5, 2.5)
+        hrp.CFrame = CFrame.new(
+            handle.Position + Vector3.new(0, pickupHeight, 0)
+        ) * hrp.CFrame.Rotation
+        StopRootVelocity(hrp)
+    end)
+
+    -- Kích hoạt TouchInterest trực tiếp nếu executor hỗ trợ, không
+    -- phụ thuộc terrain hoặc nút nhảy trên mobile.
+    pcall(function()
+        if type(firetouchinterest) == "function" then
+            firetouchinterest(hrp, handle, 0)
+            task.wait(0.05)
+            firetouchinterest(hrp, handle, 1)
+        end
+    end)
+
+    -- Fallback cho executor không hỗ trợ firetouchinterest.
+    local inputOk, inputError = pcall(function()
+        humanoid.Jump = true
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        VIM:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+        task.wait(0.05)
+        VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+    end)
+    if not inputOk then
+        pcall(function()
+            VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+        end)
+        return false, "Kích hoạt nhặt Fruit lỗi: " .. tostring(inputError)
+    end
+
+    return true
+end
+
 local function PickupFruit(fruit)
     if not fruit then return false, "Fruit không tồn tại" end
     local handle = fruit:FindFirstChild("Handle")
@@ -1535,29 +1663,21 @@ local function PickupFruit(fruit)
         worldFruitPickupInProgress = true
         local fruitSnapshot = SnapshotOwnedFruitTools()
 
-        -- Đủ gần → nhảy để trigger pickup (theo gốc dùng VirtualInputManager Space)
-        local inputOk, inputError = pcall(function()
-            VIM:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-            task.wait(0.05)
-            VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-        end)
-        if not inputOk then
-            pcall(function()
-                VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-            end)
+        local triggered, triggerError = TriggerFruitPickup(handle, hrp)
+        if not triggered then
             worldFruitPickupInProgress = false
-            return false, "Input nhặt Fruit lỗi: " .. tostring(inputError)
+            return false, triggerError
         end
 
         local newOwnedFruit = WaitForNewOwnedFruit(fruitSnapshot, 2)
-        worldFruitPickupInProgress = false
         -- Object ngoài map biến mất có thể do người khác nhặt/despawn.
         -- Chỉ xác nhận khi chính inventory của người chơi có Tool Fruit mới.
         local picked = newOwnedFruit ~= nil
-        -- Script gốc (deobfuscated.lua dòng 12460) dùng item.Name trực tiếp.
-        -- Dùng item.Name thay vì ResolveFruitDisplayName để giữ đúng tên
-        -- skin/variant (ví dụ: "Dragon East Fruit" thay vì "Dragon Fruit").
-        local pickedFruitName = picked and tostring(newOwnedFruit.Name) or nil
+        -- Chờ ngắn nếu Tool mới chỉ mang tên chung "Fruit"; ưu tiên tên hiển
+        -- thị trực tiếp để không lặp lại lỗi lấy nhầm khóa Storage làm tên trái.
+        local pickedFruitName = picked
+            and WaitForResolvedFruitDisplayName(newOwnedFruit, 0.8) or nil
+        worldFruitPickupInProgress = false
         Log(picked and "Pickup fruit thành công" or "Đã bấm Space nhưng chưa nhặt được fruit")
         return picked, picked and "Picked" or "Chưa nhặt được", pickedFruitName
     else
@@ -1648,12 +1768,15 @@ local function IsInPlayerInventory(item)
 end
 
 local function GetFruitStorageName(item)
-    local originalName = item:GetAttribute("OriginalName")
-    if type(originalName) == "string" and originalName ~= "" then
+    local originalName = GetFruitOriginalName(item)
+    if originalName then
         return originalName
     end
 
-    local baseName = string.gsub(item.Name, " Fruit", "")
+    local displayName = NormalizeFruitDisplayName(item.Name)
+    if not displayName then return nil end
+    local baseName = string.gsub(displayName, "%s+[Ff][Rr][Uu][Ii][Tt]$", "")
+    if baseName == "" then return nil end
     return baseName .. "-" .. baseName
 end
 
@@ -1693,13 +1816,17 @@ local function StoreFruitInBackpack(bypassCooldown)
             if checkOk and isFruit then
                 local metadataOk, itemName, storageName = pcall(function()
                     local resolvedStorageName = GetFruitStorageName(item)
-                    -- Script gốc (deobfuscated.lua dòng 12460) dùng item.Name
-                    -- cho webhook. Không normalize để giữ đúng tên skin/variant
-                    -- (ví dụ: "Dragon East Fruit" thay vì "Dragon Fruit").
-                    return tostring(item.Name), resolvedStorageName
+                    local resolvedDisplayName = ResolveFruitDisplayName(item)
+                    return resolvedDisplayName or tostring(item.Name), resolvedStorageName
                 end)
                 if not metadataOk then
                     Log("Đọc metadata Fruit lỗi: " .. tostring(itemName))
+                    continue
+                end
+                if not storageName then
+                    DeferFruitStore(item)
+                    deferred = deferred + 1
+                    Log("Defer StoreFruit: chưa có OriginalName cho " .. itemName)
                     continue
                 end
 
@@ -1897,8 +2024,7 @@ local function RandomFruit()
         return {
             status = "Bought",
             fruit = newFruit,
-            -- Dùng item.Name trực tiếp để giữ đúng tên skin/variant cho webhook.
-            fruitName = tostring(newFruit.Name),
+            fruitName = WaitForResolvedFruitDisplayName(newFruit, 0.8),
             detail = result,
         }
     end, function(err)
@@ -1938,101 +2064,277 @@ sg.ResetOnSpawn    = false
 sg.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
 sg.Parent          = playerGui
 
--- Frame chính
+local function AddCorner(instance, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius)
+    corner.Parent = instance
+    return corner
+end
+
+local function AddStroke(instance, color, thickness, transparency)
+    local border = Instance.new("UIStroke")
+    border.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    border.Color = color
+    border.Thickness = thickness or 1
+    border.Transparency = transparency or 0
+    border.Parent = instance
+    return border
+end
+
+local function MakeText(parent, name, position, size, text, color, font, textSize, alignment)
+    local label = Instance.new("TextLabel")
+    label.Name = name
+    label.Position = position
+    label.Size = size
+    label.BackgroundTransparency = 1
+    label.Text = text or ""
+    label.TextColor3 = color or Color3.fromRGB(235, 240, 248)
+    label.Font = font or Enum.Font.Gotham
+    label.TextSize = textSize or 13
+    label.TextXAlignment = alignment or Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.Parent = parent
+    return label
+end
+
+-- Panel mới theo mockup đã duyệt.
+local expandedSize = UDim2.fromOffset(420, 346)
+local minimizedSize = UDim2.fromOffset(420, 48)
 local frame = Instance.new("Frame")
-frame.Name              = "Main"
-frame.Size              = UDim2.new(0, 310, 0, 165)
-frame.Position          = UDim2.new(0.5, -155, 0, 8)
-frame.BackgroundColor3  = Color3.fromRGB(10, 10, 18)
-frame.BorderSizePixel   = 0
-frame.Parent            = sg
-Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
+frame.Name = "Main"
+frame.AnchorPoint = Vector2.new(0.5, 0)
+frame.Size = expandedSize
+frame.Position = UDim2.new(0.5, 0, 0, 10)
+frame.BackgroundColor3 = Color3.fromRGB(8, 12, 20)
+frame.BorderSizePixel = 0
+frame.ClipsDescendants = true
+frame.Parent = sg
+AddCorner(frame, 14)
+AddStroke(frame, Color3.fromRGB(56, 215, 255), 1.6, 0.08)
 
--- Border glow
-local stroke = Instance.new("UIStroke")
-stroke.Thickness = 1.5
-stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-stroke.Color = Color3.fromRGB(255, 175, 0)
-stroke.Transparency = 0.25
-stroke.Parent = frame
+-- Tự co để panel không tràn màn hình mobile.
+local uiScale = Instance.new("UIScale")
+uiScale.Parent = frame
+local function UpdateGuiScale()
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+    uiScale.Scale = math.min(
+        1,
+        math.max((viewport.X - 20) / expandedSize.X.Offset, 0.65),
+        math.max((viewport.Y - 20) / expandedSize.Y.Offset, 0.65)
+    )
+end
+UpdateGuiScale()
+if workspace.CurrentCamera then
+    TrackConnection(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), UpdateGuiScale)
+end
 
--- Header bar
+-- Header
 local header = Instance.new("Frame")
-header.Size             = UDim2.new(1, 0, 0, 36)
-header.BackgroundColor3 = Color3.fromRGB(20, 20, 32)
-header.BorderSizePixel  = 0
-header.Parent           = frame
-Instance.new("UICorner", header).CornerRadius = UDim.new(0, 12)
--- Ghim góc dưới header
-local headerFix = Instance.new("Frame")
-headerFix.Size            = UDim2.new(1, 0, 0, 12)
-headerFix.Position        = UDim2.new(0, 0, 1, -12)
-headerFix.BackgroundColor3 = Color3.fromRGB(20, 20, 32)
-headerFix.BorderSizePixel  = 0
-headerFix.Parent           = header
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 48)
+header.BackgroundColor3 = Color3.fromRGB(10, 15, 24)
+header.BorderSizePixel = 0
+header.Active = true
+header.Parent = frame
 
--- Tiêu đề
-local title = Instance.new("TextLabel")
-title.Size               = UDim2.new(1, -80, 1, 0)
-title.Position           = UDim2.new(0, 12, 0, 0)
-title.BackgroundTransparency = 1
-title.Text               = "🏭  Auto Factory + Fruit  |  Sea 2"
-title.TextColor3         = Color3.fromRGB(255, 200, 50)
-title.Font               = Enum.Font.GothamBold
-title.TextScaled         = true
-title.TextXAlignment     = Enum.TextXAlignment.Left
-title.Parent             = header
+MakeText(
+    header, "FactoryIcon", UDim2.fromOffset(10, 4), UDim2.fromOffset(34, 36),
+    "🏭", Color3.fromRGB(56, 215, 255), Enum.Font.GothamBold, 23,
+    Enum.TextXAlignment.Center
+)
+local title = MakeText(
+    header, "Title", UDim2.fromOffset(47, 3), UDim2.fromOffset(135, 25),
+    "AUTO FACTORY", Color3.fromRGB(245, 247, 250), Enum.Font.GothamBold, 17
+)
+local lblMode = MakeText(
+    header, "Mode", UDim2.fromOffset(48, 26), UDim2.fromOffset(142, 17),
+    "Khởi động...", Color3.fromRGB(56, 215, 255), Enum.Font.Gotham, 9
+)
 
--- Nút STOP
+local seaBadge = Instance.new("Frame")
+seaBadge.Size = UDim2.fromOffset(112, 28)
+seaBadge.Position = UDim2.fromOffset(184, 10)
+seaBadge.BackgroundColor3 = Color3.fromRGB(14, 21, 31)
+seaBadge.BorderSizePixel = 0
+seaBadge.Parent = header
+AddCorner(seaBadge, 14)
+AddStroke(seaBadge, Color3.fromRGB(57, 72, 90), 1, 0.15)
+MakeText(
+    seaBadge, "SeaStatus", UDim2.fromOffset(7, 0), UDim2.new(1, -14, 1, 0),
+    "●  SEA 2 • ONLINE", Color3.fromRGB(73, 230, 139), Enum.Font.GothamBold, 11,
+    Enum.TextXAlignment.Center
+)
+
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Name = "Minimize"
+minimizeBtn.Size = UDim2.fromOffset(32, 32)
+minimizeBtn.Position = UDim2.fromOffset(302, 8)
+minimizeBtn.BackgroundColor3 = Color3.fromRGB(23, 30, 42)
+minimizeBtn.BorderSizePixel = 0
+minimizeBtn.Text = "−"
+minimizeBtn.TextColor3 = Color3.fromRGB(230, 235, 242)
+minimizeBtn.Font = Enum.Font.GothamBold
+minimizeBtn.TextSize = 18
+minimizeBtn.Parent = header
+AddCorner(minimizeBtn, 8)
+AddStroke(minimizeBtn, Color3.fromRGB(55, 66, 82), 1, 0.2)
+
 local stopBtn = Instance.new("TextButton")
-stopBtn.Size              = UDim2.new(0, 60, 0, 24)
-stopBtn.Position          = UDim2.new(1, -68, 0.5, -12)
-stopBtn.BackgroundColor3  = Color3.fromRGB(190, 40, 40)
-stopBtn.Text              = "⏹ STOP"
-stopBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
-stopBtn.Font              = Enum.Font.GothamBold
-stopBtn.TextScaled        = true
-stopBtn.BorderSizePixel   = 0
-stopBtn.Parent            = header
-Instance.new("UICorner", stopBtn).CornerRadius = UDim.new(0, 6)
+stopBtn.Name = "Stop"
+stopBtn.Size = UDim2.fromOffset(76, 32)
+stopBtn.Position = UDim2.fromOffset(338, 8)
+stopBtn.BackgroundColor3 = Color3.fromRGB(213, 52, 57)
+stopBtn.BorderSizePixel = 0
+stopBtn.Text = "■  STOP"
+stopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+stopBtn.Font = Enum.Font.GothamBold
+stopBtn.TextSize = 12
+stopBtn.Parent = header
+AddCorner(stopBtn, 8)
+AddStroke(stopBtn, Color3.fromRGB(255, 90, 96), 1, 0.05)
+
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Position = UDim2.fromOffset(0, 48)
+body.Size = UDim2.new(1, 0, 1, -48)
+body.BackgroundTransparency = 1
+body.Parent = frame
+
+-- Account card
+local accountCard = Instance.new("Frame")
+accountCard.Name = "AccountCard"
+accountCard.Position = UDim2.fromOffset(8, 8)
+accountCard.Size = UDim2.new(1, -16, 0, 62)
+accountCard.BackgroundColor3 = Color3.fromRGB(12, 18, 28)
+accountCard.BorderSizePixel = 0
+accountCard.Parent = body
+AddCorner(accountCard, 10)
+AddStroke(accountCard, Color3.fromRGB(44, 56, 72), 1, 0.2)
+MakeText(
+    accountCard, "UserIcon", UDim2.fromOffset(10, 7), UDim2.fromOffset(44, 48),
+    "👤", Color3.fromRGB(56, 215, 255), Enum.Font.GothamBold, 27,
+    Enum.TextXAlignment.Center
+)
+MakeText(
+    accountCard, "AccountLabel", UDim2.fromOffset(62, 8), UDim2.fromOffset(170, 17),
+    "ACCOUNT", Color3.fromRGB(56, 215, 255), Enum.Font.GothamBold, 10
+)
+MakeText(
+    accountCard, "Username", UDim2.fromOffset(62, 24), UDim2.new(1, -190, 0, 29),
+    tostring(lp.Name), Color3.fromRGB(242, 245, 249), Enum.Font.GothamBold, 16
+)
+MakeText(
+    accountCard, "Running", UDim2.new(1, -118, 0, 0), UDim2.fromOffset(106, 62),
+    "●  RUNNING", Color3.fromRGB(73, 230, 139), Enum.Font.GothamBold, 11,
+    Enum.TextXAlignment.Right
+)
+
+local function MakeStatusRow(y, icon, labelText, accentColor)
+    local row = Instance.new("Frame")
+    row.Position = UDim2.fromOffset(10, y)
+    row.Size = UDim2.new(1, -20, 0, 40)
+    row.BackgroundColor3 = Color3.fromRGB(14, 20, 30)
+    row.BorderSizePixel = 0
+    row.Parent = body
+    AddCorner(row, 8)
+    AddStroke(row, Color3.fromRGB(41, 52, 66), 1, 0.2)
+
+    local iconBox = Instance.new("Frame")
+    iconBox.Size = UDim2.fromOffset(42, 40)
+    iconBox.BackgroundColor3 = Color3.fromRGB(18, 26, 38)
+    iconBox.BorderSizePixel = 0
+    iconBox.Parent = row
+    AddCorner(iconBox, 8)
+    MakeText(
+        iconBox, "Icon", UDim2.fromOffset(0, 0), UDim2.fromScale(1, 1),
+        icon, accentColor, Enum.Font.GothamBold, 20, Enum.TextXAlignment.Center
+    )
+
+    MakeText(
+        row, "Label", UDim2.fromOffset(54, 0), UDim2.fromOffset(135, 40),
+        labelText, Color3.fromRGB(238, 241, 246), Enum.Font.GothamBold, 13
+    )
+    local value = MakeText(
+        row, "Value", UDim2.fromOffset(190, 0), UDim2.new(1, -204, 1, 0),
+        "", accentColor, Enum.Font.GothamBold, 12, Enum.TextXAlignment.Right
+    )
+
+    local accent = Instance.new("Frame")
+    accent.Size = UDim2.fromOffset(3, 30)
+    accent.Position = UDim2.new(1, -5, 0.5, -15)
+    accent.BackgroundColor3 = accentColor
+    accent.BorderSizePixel = 0
+    accent.Parent = row
+    AddCorner(accent, 2)
+    return value
+end
+
+local lblBoss = MakeStatusRow(76, "⚙", "CORE", Color3.fromRGB(56, 215, 255))
+local lblFruit = MakeStatusRow(122, "◉", "FRUIT SCANNER", Color3.fromRGB(73, 230, 139))
+local lblRandom = MakeStatusRow(168, "⚄", "RANDOM FRUIT", Color3.fromRGB(197, 124, 255))
+local lblStore = MakeStatusRow(214, "◈", "STORAGE", Color3.fromRGB(255, 191, 60))
+
+local footer = Instance.new("Frame")
+footer.Position = UDim2.fromOffset(0, 258)
+footer.Size = UDim2.new(1, 0, 0, 38)
+footer.BackgroundTransparency = 1
+footer.Parent = body
+
+local function MakeChip(x, width, textValue, color)
+    local chip = Instance.new("Frame")
+    chip.Position = UDim2.fromOffset(x, 4)
+    chip.Size = UDim2.fromOffset(width, 30)
+    chip.BackgroundColor3 = Color3.fromRGB(11, 17, 26)
+    chip.BorderSizePixel = 0
+    chip.Parent = footer
+    AddCorner(chip, 15)
+    AddStroke(chip, color, 1, 0.05)
+    MakeText(
+        chip, "Text", UDim2.fromOffset(8, 0), UDim2.new(1, -16, 1, 0),
+        textValue, Color3.fromRGB(235, 239, 245), Enum.Font.GothamBold, 11,
+        Enum.TextXAlignment.Center
+    )
+    return chip
+end
+
+MakeChip(
+    42, 156,
+    CFG.AutoBuso and "⚡  AUTO BUSO   ON" or "⚡  AUTO BUSO   OFF",
+    Color3.fromRGB(255, 191, 60)
+)
+local webhookUrlForUi = GetConfiguredWebhookURL()
+local webhookOnForUi = CFG.WebhookEnabled
+    and string.find(webhookUrlForUi, "http", 1, true) ~= nil
+MakeChip(
+    222, 156,
+    webhookOnForUi and "⌘  WEBHOOK   ON" or "⌘  WEBHOOK   OFF",
+    Color3.fromRGB(56, 215, 255)
+)
+
+lblBoss.Text = "Đang chờ spawn"
+lblFruit.Text = "Đang quét bản đồ"
+lblStore.Text = "Sẵn sàng"
+lblRandom.Text = CFG.AutoRandomFruit and "Khởi động..." or "Đã tắt"
+
+local minimized = false
+TrackConnection(minimizeBtn.Activated, function()
+    minimized = not minimized
+    body.Visible = not minimized
+    frame.Size = minimized and minimizedSize or expandedSize
+    minimizeBtn.Text = minimized and "+" or "−"
+end)
 
 TrackConnection(stopBtn.MouseEnter, function()
-    stopBtn.BackgroundColor3 = Color3.fromRGB(220,55,55)
+    stopBtn.BackgroundColor3 = Color3.fromRGB(235, 66, 72)
 end)
 TrackConnection(stopBtn.MouseLeave, function()
-    stopBtn.BackgroundColor3 = Color3.fromRGB(190,40,40)
+    stopBtn.BackgroundColor3 = Color3.fromRGB(213, 52, 57)
 end)
--- Activated hoạt động với chuột, touch và gamepad.
 TrackConnection(stopBtn.Activated, function()
     globalEnv.AutoFactory = false
 end)
-
--- Labels trạng thái (5 dòng)
-local function MakeLabel(yOffset, color)
-    local lbl = Instance.new("TextLabel")
-    lbl.Size               = UDim2.new(1, -20, 0, 22)
-    lbl.Position           = UDim2.new(0, 10, 0, yOffset)
-    lbl.BackgroundTransparency = 1
-    lbl.TextColor3         = color or Color3.fromRGB(200, 200, 200)
-    lbl.Font               = Enum.Font.Gotham
-    lbl.TextScaled         = true
-    lbl.TextXAlignment     = Enum.TextXAlignment.Left
-    lbl.Parent             = frame
-    return lbl
-end
-
-local lblMode   = MakeLabel(42,  Color3.fromRGB(100, 220, 255))
-local lblBoss   = MakeLabel(65,  Color3.fromRGB(255, 130, 130))
-local lblFruit  = MakeLabel(88,  Color3.fromRGB(130, 255, 150))
-local lblStore  = MakeLabel(111, Color3.fromRGB(200, 200, 100))
-local lblRandom = MakeLabel(134, Color3.fromRGB(220, 150, 255))
-
-lblMode.Text  = "⚙️ Khởi động..."
-lblBoss.Text  = "🔍 Boss: Chờ..."
-lblFruit.Text = "🍎 Fruit: Chờ..."
-lblStore.Text = "📦 Storage: Sẵn sàng"
-lblRandom.Text = CFG.AutoRandomFruit and "🎲 Random Fruit: Khởi động..."
-    or "🎲 Random Fruit: Đã tắt"
 
 -- Drag GUI bằng chuột lẫn touch (Delta/mobile).
 local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
@@ -2081,18 +2383,18 @@ task.spawn(function()
         end
 
         if not CFG.AutoStore then
-            lblStore.Text = "📦 Auto Store: Đã tắt"
+            lblStore.Text = "Đã tắt"
             continue
         end
 
         if randomPurchaseInProgress or worldFruitPickupInProgress then
-            lblStore.Text = "📦 Chờ xác nhận Fruit mới..."
+            lblStore.Text = "Chờ xác nhận Fruit mới..."
             continue
         end
 
         local core = FindCore()
         if core and IsMobAlive(core) then
-            lblStore.Text = "📦 Storage: Tạm dừng khi đánh Core"
+            lblStore.Text = "Tạm dừng • đang đánh Core"
             continue
         end
 
@@ -2107,14 +2409,14 @@ task.spawn(function()
             elseif rejected > 0 then
                 lblStore.Text = string.format("⏭️ Bỏ qua %d Fruit không thể lưu", rejected)
             else
-                lblStore.Text = "📦 Storage: Sẵn sàng"
+                lblStore.Text = "Sẵn sàng"
             end
             continue
         end
 
         local stored, attempted, retrying, storeError, rejectedNow = StoreFruitInBackpack()
         if storeError == "cooldown" or storeError == "busy" then
-            lblStore.Text = string.format("📦 Chờ lưu: %d Fruit", count)
+            lblStore.Text = string.format("Chờ lưu: %d Fruit", count)
         elseif stored > 0 and rejectedNow > 0 then
             lblStore.Text = string.format("✅ Lưu %d | ⏭️ Bỏ qua %d", stored, rejectedNow)
         elseif rejectedNow > 0 then
@@ -2150,36 +2452,36 @@ task.spawn(function()
             if tick() < retryAt then continue end
             local callOk, bought, status, detail = pcall(RandomFruit)
             if not callOk then
-                lblRandom.Text = "⚠️ Random lỗi: " .. tostring(bought)
+                lblRandom.Text = "Lỗi: " .. tostring(bought)
                 retryAt = tick() + 3
             elseif bought then
-                lblRandom.Text = "✅ Remote Random: Thành công"
+                lblRandom.Text = "Thành công"
                 retryAt = 0
             elseif status == "Low Level" then
-                lblRandom.Text = "🎲 Random: Cần cấp 50"
+                lblRandom.Text = "Cần cấp 50"
                 retryAt = tick() + 30
             elseif status == "Cooldown" then
-                lblRandom.Text = "🎲 Random: Đang chờ cooldown"
+                lblRandom.Text = "Đang chờ cooldown"
                 retryAt = tick() + math.max(
                     tonumber(CFG.RandomCooldownCheckDelay) or 30,
                     1
                 )
             elseif status == "BuyRejected" then
-                lblRandom.Text = "⚠️ Remote Random: Server từ chối"
+                lblRandom.Text = "Server từ chối"
                 retryAt = tick() + 5
             elseif status == "BuyUnconfirmed" then
-                lblRandom.Text = "⚠️ Random: Không thấy Fruit mới"
+                lblRandom.Text = "Không thấy Fruit mới"
                 retryAt = tick() + 5
             elseif status == "RemoteError" then
-                lblRandom.Text = "⚠️ Remote Random: " .. tostring(detail)
+                lblRandom.Text = tostring(detail)
                 retryAt = tick() + 3
             else
-                lblRandom.Text = "⚠️ Random: " .. tostring(status or "Không thực hiện được")
+                lblRandom.Text = tostring(status or "Không thực hiện được")
                 retryAt = tick() + 3
             end
         else
             retryAt = 0
-            lblRandom.Text = "🎲 Random Fruit: Đã tắt"
+            lblRandom.Text = "Đã tắt"
         end
     end
 end)
@@ -2243,7 +2545,7 @@ task.spawn(function()
             local dist  = math.floor(exactDist)
 
             lblBoss.Text = string.format(
-                "💀 Core: %d/%d HP (%d%%) | %dm",
+                "%d/%d HP • %d%% • %dm",
                 hp, maxHp, pct, dist
             )
 
@@ -2326,34 +2628,99 @@ task.spawn(function()
         if moveState.purpose == "Core" or moveState.purpose == "CoreHold" then
             CancelMove(true)
         end
+
+        -- Sau khi nhặt Fruit ngoài map, ưu tiên mang về Café. Core vẫn
+        -- được xử lý trước nhánh này và có thể tạm ngắt hành trình.
+        if cafeReturnPending then
+            local cafePosition = CFG.CafePosition
+            if typeof(cafePosition) ~= "Vector3" then
+                cafeReturnPending = false
+                cafeReturnFruitName = nil
+                if moveState.purpose == "Cafe" then CancelMove(true) end
+                lblMode.Text = "Café: Tọa độ không hợp lệ"
+                Log("CafePosition không phải Vector3")
+                continue
+            end
+
+            local cafeDistance = (hrp.Position - cafePosition).Magnitude
+            local cafeArrivalDistance = math.max(
+                tonumber(CFG.CafeArrivalDistance) or 10,
+                1
+            )
+
+            if cafeDistance <= cafeArrivalDistance then
+                if moveState.purpose == "Cafe" then CancelMove(true) end
+                local returnedFruitName = cafeReturnFruitName
+                cafeReturnPending = false
+                cafeReturnFruitName = nil
+                lblMode.Text = "Đã về Café"
+                lblFruit.Text = returnedFruitName
+                    and ("Về Café: " .. returnedFruitName)
+                    or "Đã mang Fruit về Café"
+                task.wait(0.5)
+                continue
+            end
+
+            -- Không gọi requestEntrance cùng lúc remote Random/Store đang chạy.
+            if randomPurchaseInProgress or storeInProgress then
+                lblMode.Text = "Chờ xử lý Fruit trước khi về Café"
+                continue
+            end
+
+            local entranceUsed = TryCafeEntrance(cafePosition)
+            if entranceUsed then
+                lblMode.Text = "Entrance Mansion → Café"
+                lblFruit.Text = string.format("Về Café • %.0fm", cafeDistance)
+                continue
+            end
+
+            local cafeRotation = hrp.CFrame.Rotation
+            if moveState.purpose == "Cafe" and moveState.target then
+                cafeRotation = moveState.target.Rotation
+            end
+            local cafeTargetCF = CFrame.new(cafePosition) * cafeRotation
+            local moved, moveStatus = ToTarget(cafeTargetCF, true, "Cafe")
+            if moved then
+                lblMode.Text = "Đang về Café"
+                lblFruit.Text = string.format("Về Café • %.0fm", cafeDistance)
+            else
+                lblMode.Text = "Không thể về Café: "
+                    .. tostring(moveStatus or "Lỗi di chuyển")
+            end
+            continue
+        elseif moveState.purpose == "Cafe" then
+            CancelMove(true)
+        end
+
         waitTick = waitTick + 1
         local dots = string.rep(".", (waitTick % 3) + 1)
-        lblMode.Text = "🔍 Tìm Core" .. dots
-        lblBoss.Text = "💀 Boss: Chờ spawn..."
+        lblMode.Text = "Tìm Core" .. dots
+        lblBoss.Text = "Đang chờ spawn"
 
         if CFG.FruitEnabled then
             local fruit, fruitDist = FindFruitInWorld()
             if fruit then
                 fruitMode = true
                 local fruitName = ResolveFruitDisplayName(fruit) or fruit.Name
-                lblMode.Text  = "🍎 Đang nhặt Fruit..."
-                lblFruit.Text = string.format("🍎 %s (%.0fm)", fruitName, fruitDist)
+                lblMode.Text  = "Đang nhặt Fruit..."
+                lblFruit.Text = string.format("%s • %.0fm", fruitName, fruitDist)
 
                 local picked, pickupStatus, pickedFruitName = PickupFruit(fruit)
                 if picked then
                     local confirmedName = pickedFruitName
                     if confirmedName then
-                        lblFruit.Text = "✅ Đã nhặt: " .. confirmedName
+                        lblFruit.Text = "Đã nhặt: " .. confirmedName
                         SendFruitWebhook("Picked", confirmedName)
                     else
-                        lblFruit.Text = "✅ Đã nhặt Fruit (chưa xác định tên)"
+                        lblFruit.Text = "Đã nhặt Fruit (chưa xác định tên)"
                         Log("Bỏ qua webhook Picked vì chưa xác định được tên Fruit")
                     end
+                    QueueCafeReturn(confirmedName)
                 elseif pickupStatus == "Move" or pickupStatus == "Snap"
                     or pickupStatus == "Chưa nhặt được" then
-                    lblFruit.Text = "🍎 Đang tiếp cận: " .. fruitName
+                    lblFruit.Text = "Tiếp cận: " .. fruitName
                 else
-                    lblFruit.Text = "⚠️ " .. tostring(pickupStatus or "Không nhặt được Fruit")
+                    lblFruit.Text = tostring(pickupStatus or "Không nhặt được Fruit")
                 end
 
                 -- Lặp ngay để phát hiện Core vừa spawn và chuyển sang combat.
@@ -2365,14 +2732,14 @@ task.spawn(function()
             if moveState.purpose == "Fruit" then CancelMove(true) end
             if fruitMode then
                 fruitMode = false
-                lblFruit.Text = "🍎 Fruit: Không thấy"
+                lblFruit.Text = "Không thấy"
             else
-                lblFruit.Text = "🍎 Fruit: Chờ spawn..."
+                lblFruit.Text = "Đang quét bản đồ"
             end
         else
             if moveState.purpose == "Fruit" then CancelMove(true) end
             fruitMode = false
-            lblFruit.Text = "🍎 Auto Fruit: Đã tắt"
+            lblFruit.Text = "Đã tắt"
         end
 
         task.wait(0.8)
