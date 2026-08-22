@@ -243,9 +243,13 @@ end
 local lowPlayerHopDefaults = {
     ApiUrl = "https://hop.giacode.workers.dev",
     AutoStart = true,
+    InitialDelayMin = 30,       -- Chờ ít nhất 30 giây trước khi hop
+    InitialDelayMax = 60,       -- Chờ ngẫu nhiên tối đa 60 giây trước khi hop
+    TargetMinPlayers = 2,       -- Chỉ chọn/dừng ở server từ 2 người
+    TargetMaxPlayers = 5,       -- đến tối đa 5 người
     MaxPages = 30,
-    MaxPlayers = 11,
-    StopAtPlayers = 3,
+    MaxPlayers = 5,             -- Giữ tương thích config cũ
+    StopAtPlayers = 2,
     EmptyPageLimit = 4,
     PageDelay = 0.1,
     MaxAttempts = 8,
@@ -367,6 +371,47 @@ local lowPlayerHopState = {
 local LowPlayerHopController = {}
 local lowPlayerHopRandom = Random.new()
 
+local function GetLowPlayerTargetRange()
+    local minPlayers = math.max(math.floor(
+        tonumber(LowPlayerHopConfig.TargetMinPlayers) or 2
+    ), 1)
+    local maxPlayers = math.max(math.floor(
+        tonumber(LowPlayerHopConfig.TargetMaxPlayers) or 5
+    ), 1)
+    if minPlayers > maxPlayers then
+        minPlayers, maxPlayers = maxPlayers, minPlayers
+    end
+    return minPlayers, maxPlayers
+end
+
+local function GetCurrentServerPlayerCount()
+    return #Players:GetPlayers()
+end
+
+local function IsTargetPlayerCount(playerCount)
+    local minPlayers, maxPlayers = GetLowPlayerTargetRange()
+    playerCount = tonumber(playerCount)
+    return playerCount ~= nil
+        and playerCount >= minPlayers
+        and playerCount <= maxPlayers
+end
+
+local function GetInitialHopDelay()
+    local minDelay = math.max(
+        tonumber(LowPlayerHopConfig.InitialDelayMin) or 30,
+        0
+    )
+    local maxDelay = math.max(
+        tonumber(LowPlayerHopConfig.InitialDelayMax) or 60,
+        0
+    )
+    if minDelay > maxDelay then
+        minDelay, maxDelay = maxDelay, minDelay
+    end
+    if minDelay == maxDelay then return minDelay end
+    return lowPlayerHopRandom:NextNumber(minDelay, maxDelay)
+end
+
 local function NotifyLowPlayerHop(title, message, duration)
     if not LowPlayerHopConfig.NotifyOnScreen then return end
 
@@ -387,6 +432,16 @@ local function SetLowPlayerHopStatus(message, showToast)
     if showToast then
         NotifyLowPlayerHop("Server Hop", message, 3)
     end
+end
+
+local function StopHopAtTargetServer(playerCount)
+    local minPlayers, maxPlayers = GetLowPlayerTargetRange()
+    SetLowPlayerHopStatus(string.format(
+        "Server hiện có %d người (đạt %d-%d), dừng hop.",
+        playerCount,
+        minPlayers,
+        maxPlayers
+    ), true)
 end
 
 local function IsLowPlayerHopActive(sessionId)
@@ -419,8 +474,8 @@ end
 local function FindLowPlayerViaServerBrowser(serverBrowser, sessionId, occupiedMap)
     local bestCount = math.huge
     local bestCandidates = {}
-    local fallbackCandidates = {}
     local consecutiveEmpty = 0
+    local targetMinPlayers, targetMaxPlayers = GetLowPlayerTargetRange()
 
     for page = 1, LowPlayerHopConfig.MaxPages do
         if not IsLowPlayerHopActive(sessionId) then return nil end
@@ -442,10 +497,8 @@ local function FindLowPlayerViaServerBrowser(serverBrowser, sessionId, occupiedM
                         Players = playerCount,
                         Page = page,
                     }
-                    if playerCount < 12 then
-                        table.insert(fallbackCandidates, candidate)
-                    end
-                    if playerCount <= LowPlayerHopConfig.MaxPlayers then
+                    if playerCount >= targetMinPlayers
+                        and playerCount <= targetMaxPlayers then
                         if playerCount < bestCount then
                             bestCount = playerCount
                             bestCandidates = { candidate }
@@ -468,11 +521,6 @@ local function FindLowPlayerViaServerBrowser(serverBrowser, sessionId, occupiedM
 
     if #bestCandidates > 0 then
         return ChooseLowPlayerCandidate(bestCandidates)
-    elseif #fallbackCandidates > 0 then
-        table.sort(fallbackCandidates, function(a, b)
-            return a.Players < b.Players
-        end)
-        return fallbackCandidates[1]
     end
     return nil
 end
@@ -484,6 +532,7 @@ local function FindLowPlayerViaRobloxApi(sessionId, occupiedMap)
     local cursor = ""
     local bestCount = math.huge
     local bestCandidates = {}
+    local targetMinPlayers, targetMaxPlayers = GetLowPlayerTargetRange()
 
     for _ = 1, 4 do
         if not IsLowPlayerHopActive(sessionId) then return nil end
@@ -515,7 +564,8 @@ local function FindLowPlayerViaRobloxApi(sessionId, occupiedMap)
             if jobId ~= ""
                 and not IsLowPlayerServerVisited(jobId, occupiedMap)
                 and playerCount < maxPlayers
-                and playerCount <= LowPlayerHopConfig.MaxPlayers then
+                and playerCount >= targetMinPlayers
+                and playerCount <= targetMaxPlayers then
                 local candidate = {
                     JobId = jobId,
                     Players = playerCount,
@@ -572,6 +622,11 @@ local function RunLowPlayerHop(sessionId)
 
     for attempt = 1, LowPlayerHopConfig.MaxAttempts do
         if not IsLowPlayerHopActive(sessionId) then return false end
+        local currentPlayerCount = GetCurrentServerPlayerCount()
+        if IsTargetPlayerCount(currentPlayerCount) then
+            StopHopAtTargetServer(currentPlayerCount)
+            return true
+        end
         lowPlayerHopState.Attempts = attempt
         SetLowPlayerHopStatus(string.format(
             "Đang quét server (Lần %d/%d)...",
@@ -620,6 +675,12 @@ function LowPlayerHopController.Start()
         return false
     end
 
+    local currentPlayerCount = GetCurrentServerPlayerCount()
+    if IsTargetPlayerCount(currentPlayerCount) then
+        StopHopAtTargetServer(currentPlayerCount)
+        return false
+    end
+
     lowPlayerHopState.Running = true
     lowPlayerHopState.Attempts = 0
     lowPlayerHopState.SessionId = lowPlayerHopState.SessionId + 1
@@ -627,6 +688,30 @@ function LowPlayerHopController.Start()
 
     task.spawn(function()
         local ok, err = pcall(function()
+            local initialDelay = GetInitialHopDelay()
+            if initialDelay > 0 then
+                SetLowPlayerHopStatus(string.format(
+                    "Chờ %d giây trước khi hop...",
+                    math.ceil(initialDelay)
+                ), true)
+
+                local deadline = os.clock() + initialDelay
+                while IsLowPlayerHopActive(sessionId) and os.clock() < deadline do
+                    local playerCount = GetCurrentServerPlayerCount()
+                    if IsTargetPlayerCount(playerCount) then
+                        StopHopAtTargetServer(playerCount)
+                        return
+                    end
+                    task.wait(math.min(1, math.max(deadline - os.clock(), 0.05)))
+                end
+            end
+
+            if not IsLowPlayerHopActive(sessionId) then return end
+            local playerCount = GetCurrentServerPlayerCount()
+            if IsTargetPlayerCount(playerCount) then
+                StopHopAtTargetServer(playerCount)
+                return
+            end
             RunLowPlayerHop(sessionId)
         end)
         if not ok and LowPlayerHopConfig.Verbose then
