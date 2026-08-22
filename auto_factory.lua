@@ -2149,13 +2149,14 @@ MakeText(
     Enum.TextXAlignment.Center
 )
 local title = MakeText(
-    header, "Title", UDim2.fromOffset(47, 3), UDim2.fromOffset(135, 25),
+    header, "Title", UDim2.fromOffset(47, 11), UDim2.fromOffset(135, 26),
     "AUTO FACTORY", Color3.fromRGB(245, 247, 250), Enum.Font.GothamBold, 17
 )
 local lblMode = MakeText(
     header, "Mode", UDim2.fromOffset(48, 26), UDim2.fromOffset(142, 17),
     "Khởi động...", Color3.fromRGB(56, 215, 255), Enum.Font.Gotham, 9
 )
+lblMode.Visible = false
 
 local seaBadge = Instance.new("Frame")
 seaBadge.Size = UDim2.fromOffset(112, 28)
