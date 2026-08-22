@@ -97,6 +97,7 @@ local CFG = {
     UseFactoryEntrance = true, -- Khi ở xa, requestEntrance tới Mansion trước
     FactoryEntranceMinDistance = 3000, -- Chỉ dùng Entrance nếu cách Factory ít nhất 3000 studs
     FactoryEntranceCooldown = 2, -- Tránh spam requestEntrance nếu server không dịch chuyển
+    FactoryFinishDelay = 5, -- Chờ sau khi hạ Core rồi mới tiếp tục tác vụ khác
 
     -- Fruit
     FruitEnabled  = true,   -- Bật/tắt tính năng tìm fruit
@@ -2499,6 +2500,8 @@ task.spawn(function()
     local ok, runError = xpcall(function()
         local waitTick  = 0
         local fruitMode = false
+        local coreWasAlive = false
+        local factoryDelayUntil = 0
 
         while globalEnv.AutoFactory
             and globalEnv.AutoFactoryRunToken == runToken
@@ -2532,6 +2535,8 @@ task.spawn(function()
         if core and IsMobAlive(core) then
             waitTick = 0
             fruitMode = false
+            coreWasAlive = true
+            factoryDelayUntil = 0
 
             local bossHRP = core:FindFirstChild("HumanoidRootPart")
             local bossHumanoid = core:FindFirstChild("Humanoid")
@@ -2628,6 +2633,29 @@ task.spawn(function()
         -- ══════════════════════════════════════
         if moveState.purpose == "Core" or moveState.purpose == "CoreHold" then
             CancelMove(true)
+        end
+
+        -- Chỉ bắt đầu delay khi Core vừa chuyển từ còn sống sang biến mất/chết.
+        -- Vòng lặp vẫn kiểm tra Core trước nhánh này nên boss mới luôn được ưu tiên.
+        if coreWasAlive then
+            coreWasAlive = false
+            factoryDelayUntil = tick() + math.max(
+                tonumber(CFG.FactoryFinishDelay) or 5,
+                0
+            )
+        end
+
+        local factoryDelayRemaining = factoryDelayUntil - tick()
+        if factoryDelayRemaining > 0 then
+            lblBoss.Text = string.format(
+                "Hoàn tất • chờ %ds",
+                math.max(math.ceil(factoryDelayRemaining), 1)
+            )
+            lblFruit.Text = "Tạm chờ sau Factory"
+            task.wait(0.1)
+            continue
+        elseif factoryDelayUntil > 0 then
+            factoryDelayUntil = 0
         end
 
         -- Sau khi nhặt Fruit ngoài map, ưu tiên mang về Café. Core vẫn
